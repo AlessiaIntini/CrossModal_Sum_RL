@@ -1,0 +1,12 @@
+# Dipendenze per train_dpo.py
+torch==2.13.0
+torchvision==0.28.0
+transformers==5.16.1
+accelerate==1.14.0
+peft==0.20.0
+qwen-vl-utils==0.0.14
+av==18.1.0
+pillow==12.3.0
+tqdm==4.70.0
+scikit-learn
+scipy
