@@ -23,18 +23,17 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from transformers import get_cosine_schedule_with_warmup
 from utils import compute_kendall, compute_spearman
 
-DEFAULT_MODEL = Path("/leonardo_work/IscrC_MSMU/aintini0/models/Qwen2.5-VL-3B-Instruct")
-DEFAULT_DATA = Path(
-    "/leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/metadata/derived/"
-    "train_videoxum_dpo.json"
+PROJECT_ROOT = Path(__file__).resolve().parent
+VIDEOXUM_ROOT = PROJECT_ROOT / "dataset" / "aintini" / "datasets" / "videoxum"
+DEFAULT_MODEL = PROJECT_ROOT / "models" / "Qwen2.5-VL-7B-Instruct"
+DEFAULT_DATA = (
+    VIDEOXUM_ROOT / "metadata" / "derived" / "train_videoxum_dpo.json"
 )
-DEFAULT_VIDEO_DIR = Path("/leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/train")
-DEFAULT_SAVEROOT = Path(
-    "/leonardo_scratch/fast/IscrC_MSMU/aintini0/GRPOVideo/checkpoints"
-)
-DEFAULT_RESULTSROOT = Path(
-    "/leonardo_work/IscrC_MSMU/aintini0/GRPOVideo/results/dpo"
-)
+DEFAULT_VIDEO_DIR = VIDEOXUM_ROOT / "train"
+DEFAULT_VAL_DATA = VIDEOXUM_ROOT / "metadata" / "val_videoxum.json"
+DEFAULT_VAL_VIDEO_DIR = VIDEOXUM_ROOT / "val"
+DEFAULT_SAVEROOT = PROJECT_ROOT / "outputs" / "dpo" / "checkpoints"
+DEFAULT_RESULTSROOT = PROJECT_ROOT / "outputs" / "dpo" / "results"
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
 TRAINING_STATE_NAME = "training_state.pt"
 SYSTEM_PROMPT = (
@@ -227,6 +226,10 @@ def build_messages(sample, args, response=None, video_frames=None):
         "type": "video",
         "video": video_frames if video_frames is not None else sample["video_path"],
         "max_pixels": args.max_pixels,
+        # qwen_vl_utils usa 128*28*28 come minimo predefinito per i video.
+        # Rendendolo configurabile possiamo ridurre max_pixels senza ottenere
+        # l'assert "max_pixels >= min_pixels" durante il preprocessing.
+        "min_pixels": args.min_pixels,
     }
     if video_frames is not None:
         pass
@@ -822,8 +825,10 @@ def parse_args():
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--data_json", type=Path, default=DEFAULT_DATA)
     parser.add_argument("--video_dir", type=Path, default=DEFAULT_VIDEO_DIR)
-    parser.add_argument("--val_json", type=Path)
-    parser.add_argument("--val_video_dir", type=Path)
+    parser.add_argument("--val_json", type=Path, default=DEFAULT_VAL_DATA)
+    parser.add_argument(
+        "--val_video_dir", type=Path, default=DEFAULT_VAL_VIDEO_DIR
+    )
     parser.add_argument("--val_ratio", type=float, default=0.05)
     parser.add_argument("--saveroot", type=Path, default=DEFAULT_SAVEROOT)
     parser.add_argument("--resultsroot", type=Path, default=DEFAULT_RESULTSROOT)
@@ -854,6 +859,10 @@ def parse_args():
         help="limite di sicurezza; 0 non tronca la timeline a 1 FPS",
     )
     parser.add_argument("--max_pixels", type=positive_int, default=256 * 28 * 28)
+    parser.add_argument(
+        "--min_pixels", type=positive_int, default=4 * 28 * 28,
+        help="numero minimo di pixel per frame; deve essere <= --max_pixels",
+    )
     parser.add_argument("--lora_r", type=positive_int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--save_steps", type=positive_int, default=100)
@@ -871,6 +880,11 @@ def parse_args():
 
 if __name__ == "__main__":
     cli_args = parse_args()
+    if cli_args.min_pixels > cli_args.max_pixels:
+        raise SystemExit(
+            f"--min_pixels ({cli_args.min_pixels}) non puo' superare "
+            f"--max_pixels ({cli_args.max_pixels})"
+        )
     if cli_args.eval_only:
         if cli_args.eval_checkpoint is None:
             raise SystemExit("--eval_only richiede --eval_checkpoint CHECKPOINT")

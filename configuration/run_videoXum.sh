@@ -11,33 +11,40 @@
 
 set -euo pipefail
 
-cd /leonardo/home/userexternal/aintini0/GRPOVideo
-module load python/3.11.7
-source /leonardo_scratch/fast/IscrC_MSMU/aintini0/venvs/grpovideo/bin/activate
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${PROJECT_DIR:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
+VIDEOXUM_DATA_ROOT="${VIDEOXUM_DATA_ROOT:-$PROJECT_DIR/dataset/aintini/datasets/videoxum}"
+VIDEOXUM_METADATA_DIR="${VIDEOXUM_METADATA_DIR:-$VIDEOXUM_DATA_ROOT/metadata}"
 
-export HF_HOME="${SCRATCH}/GRPOVideo/cache/huggingface"
-export PIP_CACHE_DIR="${SCRATCH}/GRPOVideo/cache/pip"
+export HF_HOME="${HF_HOME:-$PROJECT_DIR/.cache/huggingface}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$PROJECT_DIR/.cache/pip}"
+export VIDEOXUM_METADATA_DIR
 
-python - <<'PY'
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+    PYTHON_EXECUTABLE="$PYTHON_BIN"
+elif [[ -x "$PROJECT_DIR/.venv/bin/python" ]]; then
+    PYTHON_EXECUTABLE="$PROJECT_DIR/.venv/bin/python"
+else
+    PYTHON_EXECUTABLE="python3"
+fi
+
+cd "$PROJECT_DIR"
+
+"$PYTHON_EXECUTABLE" - <<'PY'
 import json
 import os
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
+try:
+    from huggingface_hub import snapshot_download
+except ImportError as error:
+    raise SystemExit(
+        "Dipendenza mancante: installa huggingface_hub con "
+        "`python3 -m pip install huggingface_hub`."
+    ) from error
 
-output_dir = (
-    Path(os.environ["WORK"])
-    / os.environ["USER"]
-    / "datasets"
-    / "videoxum"
-    / "metadata"
-    / "huggingface_original"
-)
-cache_dir = (
-    Path(os.environ.get("SCRATCH") or os.environ["CINECA_SCRATCH"])
-    / "videoxum_metadata"
-    / "hf_cache"
-)
+output_dir = Path(os.environ["VIDEOXUM_METADATA_DIR"])
+cache_dir = Path(os.environ["HF_HOME"])
 filenames = [
     "train_videoxum.json",
     "val_videoxum.json",

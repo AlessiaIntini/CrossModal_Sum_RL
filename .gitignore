@@ -1,5 +1,12 @@
 *.out
 __pycache__/
+.venv/
+.cache/
+outputs/
 *.err
 train_videoxum_dpo.json
 train_videoxum_medoid.json
+dataset/
+temp/
+models/
+logs/

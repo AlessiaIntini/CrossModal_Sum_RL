@@ -58,6 +58,7 @@ srun python -u train_dpo.py \
     --lora_r 16 \
     --lora_dropout 0.05 \
     --max_pixels 100352 \
+    --min_pixels 3136 \
     --fps 1 \
     --max_frames 0 \
     --device cuda:0

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""LoRA-DPO Qwen2.5-VL su video e frame chosen/rejected VideoXum."""
+"""SFT Qwen2.5-VL su video VideoXum, usando come target le risposte 'chosen'
+dello stesso dataset di preferenze usato per la DPO."""
 
 import argparse
 import json
@@ -23,19 +24,21 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from transformers import get_cosine_schedule_with_warmup
 from utils import compute_kendall, compute_spearman
 
-DEFAULT_MODEL = Path("/leonardo_work/IscrC_MSMU/aintini0/models/Qwen2.5-VL-3B-Instruct")
-DEFAULT_DATA = Path(
-    "/leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/metadata/derived/"
-    "train_videoxum_dpo.json"
+PROJECT_ROOT = Path(__file__).resolve().parent
+VIDEOXUM_ROOT = PROJECT_ROOT / "dataset" / "aintini" / "datasets" / "videoxum"
+DEFAULT_MODEL = PROJECT_ROOT / "models" / "Qwen2.5-VL-7B-Instruct"
+# Stesso file JSON usato dalla DPO: contiene gia' vsum_onehot_chosen/rejected.
+# La SFT usa solo il campo "chosen".
+DEFAULT_DATA = (
+    VIDEOXUM_ROOT / "metadata" / "derived" / "train_videoxum_dpo.json"
 )
-DEFAULT_VIDEO_DIR = Path("/leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/train")
-DEFAULT_SAVEROOT = Path(
-    "/leonardo_scratch/fast/IscrC_MSMU/aintini0/GRPOVideo/checkpoints"
-)
-DEFAULT_RESULTSROOT = Path(
-    "/leonardo_work/IscrC_MSMU/aintini0/GRPOVideo/results/dpo"
-)
+DEFAULT_VIDEO_DIR = VIDEOXUM_ROOT / "train"
+DEFAULT_VAL_DATA = VIDEOXUM_ROOT / "metadata" / "val_videoxum.json"
+DEFAULT_VAL_VIDEO_DIR = VIDEOXUM_ROOT / "val"
+DEFAULT_SAVEROOT = PROJECT_ROOT / "outputs" / "sft" / "checkpoints"
+DEFAULT_RESULTSROOT = PROJECT_ROOT / "outputs" / "sft" / "results"
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
+TRAINING_STATE_NAME = "training_state.pt"
 SYSTEM_PROMPT = (
     "You are a video summarization assistant. Select the frames that best "
     "summarize the important events in the video."
@@ -45,9 +48,9 @@ SYSTEM_PROMPT = (
 def format_response(onehot):
     """Converte una label one-hot in intervalli JSON inclusivi [inizio, fine]."""
     if not isinstance(onehot, list) or not onehot:
-        raise ValueError("label chosen/rejected vuota o non valida")
+        raise ValueError("label chosen vuota o non valida")
     if any(value not in (0, 1, False, True) for value in onehot):
-        raise ValueError("le label chosen/rejected devono contenere solo 0 e 1")
+        raise ValueError("la label chosen deve contenere solo 0 e 1")
 
     intervals = []
     start = None
@@ -74,23 +77,18 @@ def resolve_video(video_dir, video_id):
     return video_dir / f"{video_id}.mp4"
 
 
-def load_records(path, require_preferences=True):
+def load_records(path, require_chosen=True):
+    """Come nella DPO, ma qui serve solo 'vsum_onehot_chosen', non 'rejected'."""
     with path.open(encoding="utf-8") as handle:
         payload = json.load(handle)
     items = payload.items() if isinstance(payload, dict) else enumerate(payload)
     records = []
     for key, record in items:
         required = {"sampled_frames", "vsum_onehot"}
-        preference_fields = {"vsum_onehot_chosen", "vsum_onehot_rejected"}
-        if require_preferences:
-            required |= preference_fields
+        if require_chosen:
+            required |= {"vsum_onehot_chosen"}
         if missing := required - set(record):
             raise ValueError(f"Record {key!r}: campi mancanti {sorted(missing)}")
-        present_preferences = preference_fields & set(record)
-        if present_preferences and present_preferences != preference_fields:
-            raise ValueError(
-                f"Record {key!r}: coppia chosen/rejected incompleta"
-            )
         references = record["vsum_onehot"]
         frame_count = int(record["sampled_frames"])
         if len(references) != 10 or any(
@@ -105,18 +103,14 @@ def load_records(path, require_preferences=True):
             "sampled_frames": frame_count,
             "references": references,
         }
-        if present_preferences:
+        if require_chosen:
             chosen = record["vsum_onehot_chosen"]
-            rejected = record["vsum_onehot_rejected"]
-            if len(chosen) != frame_count or len(rejected) != frame_count:
+            if len(chosen) != frame_count:
                 raise ValueError(
                     f"Record {key!r}: sampled_frames={frame_count}, "
-                    f"len(chosen)={len(chosen)}, len(rejected)={len(rejected)}"
+                    f"len(chosen)={len(chosen)}"
                 )
-            if chosen == rejected:
-                raise ValueError(f"Record {key!r}: chosen e rejected coincidono")
-            item["chosen"] = chosen
-            item["rejected"] = rejected
+            item["target"] = format_response(chosen)
         records.append(item)
     if not records:
         raise ValueError(f"Nessun record in {path}")
@@ -135,7 +129,7 @@ def split_records(records, val_ratio, seed):
     )
 
 
-class VideoXumDPODataset(Dataset):
+class VideoXumSFTDataset(Dataset):
     def __init__(self, records, video_dir):
         self.records = records
         self.paths = [resolve_video(video_dir, item["video_id"]) for item in records]
@@ -155,12 +149,6 @@ class VideoXumDPODataset(Dataset):
         sample = {
             "video_path": str(self.paths[index]),
             "sampled_frames": count,
-            # Prompt precedente:
-            # "The timeline has {count} candidate frames, numbered from 0 to "
-            # "{count - 1}, sampled at one frame per second. Return only a JSON "
-            # "array of inclusive [start, end] frame-index intervals that form "
-            # "the best extractive video summary, in chronological order. "
-            # "Represent an isolated frame i as [i, i]."
             "prompt": (
                 f"The timeline contains {count} candidate frames, numbered from 0 "
                 f"to {count - 1}, sampled at one frame per second. Select the "
@@ -174,11 +162,9 @@ class VideoXumDPODataset(Dataset):
             ),
             "references": record["references"],
         }
-        if "chosen" in record:
-            sample["chosen"] = format_response(record["chosen"])
-            sample["rejected"] = format_response(record["rejected"])
+        if "target" in record:
+            sample["target"] = record["target"]
         return sample
-
 
 
 def decode_video_frames(sample, args):
@@ -212,12 +198,6 @@ def decode_video_frames(sample, args):
                 if len(frames) == expected_frames:
                     break
 
-    # if len(frames) != expected_frames:
-    #     raise ValueError(
-    #         f"A 1 FPS sono stati estratti {len(frames)} frame da "
-    #         f"{sample['video_path']}, ma le label ne richiedono "
-    #         f"{expected_frames}."
-    #     )
     return frames
 
 
@@ -226,6 +206,11 @@ def build_messages(sample, args, response=None, video_frames=None):
         "type": "video",
         "video": video_frames if video_frames is not None else sample["video_path"],
         "max_pixels": args.max_pixels,
+        # qwen_vl_utils usa di default VIDEO_MIN_PIXELS=128*28*28=100352 per i
+        # video. Se --max_pixels scende sotto quella soglia (es. per risparmiare
+        # VRAM), l'assert interno "max_pixels >= min_pixels" fallisce a meno di
+        # abbassare esplicitamente anche min_pixels qui.
+        "min_pixels": args.min_pixels,
     }
     if video_frames is not None:
         pass
@@ -258,7 +243,7 @@ def prepare_completion(processor, sample, response, args, video_frames=None):
         full_messages, tokenize=False, add_generation_prompt=False
     )
     images, videos = process_vision_info(prompt_messages)
-    common = dict(images=images, videos=videos, padding=False, return_tensors="pt",cap_pixels_per_frame=True)
+    common = dict(images=images, videos=videos, padding=False, return_tensors="pt", cap_pixels_per_frame=True)
     prompt_inputs = processor(text=[prompt_text], **common)
     full_inputs = processor(text=[full_text], **common)
     prompt_ids = prompt_inputs["input_ids"][0]
@@ -278,38 +263,17 @@ def move_inputs(inputs, device):
     }
 
 
-def completion_log_prob(model, inputs, prompt_len):
-    input_ids = inputs["input_ids"][0]
-    with torch.autocast(
-        device_type=input_ids.device.type,
-        dtype=torch.bfloat16,
-        enabled=input_ids.device.type == "cuda",
-    ):
-        outputs = model(**inputs)
-    logits = outputs.logits[0, prompt_len - 1:input_ids.numel() - 1].float()
-    labels = input_ids[prompt_len:]
-    del outputs
-    return F.log_softmax(logits, dim=-1).gather(1, labels[:, None]).sum()
-
-
-def prepare_pair(processor, sample, args, device, video_frames=None):
+def prepare_sft_example(processor, sample, args, device, video_frames=None):
+    """Prepara input_ids + labels (prompt mascherato a -100) per la CE loss."""
     frames = video_frames if video_frames is not None else decode_video_frames(sample, args)
-    chosen, chosen_start = prepare_completion(
-        processor, sample, sample["chosen"], args, frames
+    full_inputs, prompt_len = prepare_completion(
+        processor, sample, sample["target"], args, frames
     )
-    rejected, rejected_start = prepare_completion(
-        processor, sample, sample["rejected"], args, frames
-    )
-    return (
-        move_inputs(chosen, device), chosen_start,
-        move_inputs(rejected, device), rejected_start,
-    )
-
-
-def dpo_loss(chosen_pol, rejected_pol, chosen_ref, rejected_ref, beta):
-    policy_margin = chosen_pol - rejected_pol
-    reference_margin = chosen_ref.detach() - rejected_ref.detach()
-    return -F.logsigmoid(beta * (policy_margin - reference_margin))
+    labels = full_inputs["input_ids"].clone()
+    labels[:, :prompt_len] = -100
+    full_inputs["labels"] = labels
+    completion_tokens = full_inputs["input_ids"].shape[-1] - prompt_len
+    return move_inputs(full_inputs, device), completion_tokens
 
 
 def write_metric(handle, **values):
@@ -409,27 +373,13 @@ def generate_interval_response(model, processor, sample, args, device, frames):
 def evaluate(model, processor, dataset, args, device, metrics_file, run_id, epoch):
     model.eval()
     limit = len(dataset) if args.eval_samples <= 0 else min(args.eval_samples, len(dataset))
-    correct, margins, invalid_predictions = 0, [], 0
+    invalid_predictions = 0
     metric_values = {
         name: [] for name in ("f1_max", "f1_mean", "kendall", "spearman")
     }
     for index in tqdm(range(limit), desc="validation", unit="video", leave=False):
         sample = dataset[index]
         frames = decode_video_frames(sample, args)
-        chosen_tokens = rejected_tokens = margin = None
-        if "chosen" in sample:
-            chosen, chosen_start, rejected, rejected_start = prepare_pair(
-                processor, sample, args, device, video_frames=frames
-            )
-            chosen_lp = completion_log_prob(model, chosen, chosen_start)
-            rejected_lp = completion_log_prob(model, rejected, rejected_start)
-            margin = (chosen_lp - rejected_lp).item()
-            chosen_tokens = chosen["input_ids"].shape[-1] - chosen_start
-            rejected_tokens = rejected["input_ids"].shape[-1] - rejected_start
-            correct += margin > 0
-            margins.append(margin)
-            del chosen, rejected, chosen_lp, rejected_lp
-
         response = generate_interval_response(
             model, processor, sample, args, device, frames
         )
@@ -454,9 +404,6 @@ def evaluate(model, processor, dataset, args, device, metrics_file, run_id, epoc
             epoch=epoch,
             sample_position=index + 1,
             dataset_index=index,
-            chosen_completion_tokens=chosen_tokens,
-            rejected_completion_tokens=rejected_tokens,
-            policy_margin=margin,
             generated_response=response,
             prediction_valid=parse_error is None,
             parse_error=parse_error,
@@ -466,22 +413,10 @@ def evaluate(model, processor, dataset, args, device, metrics_file, run_id, epoc
         )
         if device.type == "cuda":
             torch.cuda.empty_cache()
-    if margins:
-        accuracy = correct / len(margins)
-        mean_margin = sum(margins) / len(margins)
-    else:
-        accuracy = mean_margin = None
     summary_metrics = {
         name: sum(values) / len(values)
         for name, values in metric_values.items()
     }
-    if margins:
-        print(
-            f"[val] pairwise_accuracy={accuracy:.4f} ({correct}/{len(margins)}) "
-            f"mean_logprob_margin={mean_margin:.4f}"
-        )
-    else:
-        print("[val] pairwise DPO non disponibile: validation senza chosen/rejected")
     print(
         f"[val] VideoXum F1_MAX={summary_metrics['f1_max']:.4f} "
         f"F1_MEAN={summary_metrics['f1_mean']:.4f} "
@@ -496,26 +431,23 @@ def evaluate(model, processor, dataset, args, device, metrics_file, run_id, epoc
         split="validation",
         epoch=epoch,
         samples=limit,
-        pairwise_samples=len(margins),
-        pairwise_accuracy=accuracy,
-        mean_policy_margin=mean_margin,
         invalid_predictions=invalid_predictions,
         metric_protocol="VideoXum aggregation; binary generated saliency",
         **summary_metrics,
     )
-    return accuracy, mean_margin, summary_metrics
+    return summary_metrics
 
 
 def load_datasets(args):
-    records = load_records(args.data_json, require_preferences=True)
+    records = load_records(args.data_json, require_chosen=True)
     if args.val_json:
         train_records = records
-        val_records = load_records(args.val_json, require_preferences=False)
+        val_records = load_records(args.val_json, require_chosen=False)
     else:
         train_records, val_records = split_records(records, args.val_ratio, args.seed)
     val_video_dir = args.val_video_dir or args.video_dir
-    train = VideoXumDPODataset(train_records, args.video_dir)
-    val = VideoXumDPODataset(val_records, val_video_dir)
+    train = VideoXumSFTDataset(train_records, args.video_dir)
+    val = VideoXumSFTDataset(val_records, val_video_dir)
     print(f"[data] train={len(train)}, val={len(val)}, val_video_dir={val_video_dir}")
     return train, val
 
@@ -523,12 +455,12 @@ def load_datasets(args):
 def load_validation_dataset(args):
     """Carica solo lo split necessario alla validation standalone."""
     if args.val_json:
-        val_records = load_records(args.val_json, require_preferences=False)
+        val_records = load_records(args.val_json, require_chosen=False)
     else:
-        records = load_records(args.data_json, require_preferences=True)
+        records = load_records(args.data_json, require_chosen=True)
         _, val_records = split_records(records, args.val_ratio, args.seed)
     val_video_dir = args.val_video_dir or args.video_dir
-    val = VideoXumDPODataset(val_records, val_video_dir)
+    val = VideoXumSFTDataset(val_records, val_video_dir)
     print(f"[data] val={len(val)}, val_video_dir={val_video_dir}")
     return val
 
@@ -651,29 +583,116 @@ def train(args):
     print(f"[train] samples={n_samples}, steps={total_steps}")
 
     best_f1_mean, global_step = -1.0, 0
+    start_epoch, samples_seen_in_epoch = 0, 0
+    if args.resume_from:
+        state_path = args.resume_from / TRAINING_STATE_NAME
+        if state_path.is_file():
+            state = torch.load(state_path, map_location=device, weights_only=False)
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            global_step = int(state["global_step"])
+            start_epoch = int(state["epoch"])
+            samples_seen_in_epoch = int(state["samples_seen_in_epoch"])
+            best_f1_mean = float(state.get("best_f1_mean", -1.0))
+            random.setstate(state["python_rng_state"])
+            torch.set_rng_state(state["torch_rng_state"].cpu())
+            if device.type == "cuda" and state.get("cuda_rng_state") is not None:
+                torch.cuda.set_rng_state_all(state["cuda_rng_state"])
+            print(
+                f"[resume] stato completo da {state_path}: step={global_step}, "
+                f"epoch={start_epoch + 1}, campioni_gia_visti={samples_seen_in_epoch}"
+            )
+        else:
+            match = re.fullmatch(r"checkpoint-(\d+)", args.resume_from.name)
+            if match is None:
+                raise ValueError(
+                    f"{args.resume_from} non contiene {TRAINING_STATE_NAME} e il nome "
+                    "non permette di ricavare lo step (atteso checkpoint-N)"
+                )
+            global_step = int(match.group(1))
+            steps_per_epoch = math.ceil(n_samples / args.accum_steps)
+            start_epoch, step_in_epoch = divmod(global_step, steps_per_epoch)
+            samples_seen_in_epoch = min(step_in_epoch * args.accum_steps, n_samples)
+            for _ in range(global_step):
+                optimizer.step()
+                scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            print(
+                f"[resume] checkpoint legacy: riparto da step={global_step}, "
+                f"epoch={start_epoch + 1}, campioni_gia_visti={samples_seen_in_epoch}. "
+                "Optimizer non disponibile: viene reinizializzato; scheduler allineato."
+            )
+
+    def save_checkpoint(path, next_epoch, next_samples_seen):
+        path.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(path)
+        processor.save_pretrained(path)
+        state = {
+            "global_step": global_step,
+            "epoch": next_epoch,
+            "samples_seen_in_epoch": next_samples_seen,
+            "best_f1_mean": best_f1_mean,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "python_rng_state": random.getstate(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+        }
+        temporary_state = path / f"{TRAINING_STATE_NAME}.tmp"
+        torch.save(state, temporary_state)
+        temporary_state.replace(path / TRAINING_STATE_NAME)
+
     optimizer.zero_grad(set_to_none=True)
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         indices = list(range(len(train_dataset)))
         random.Random(args.seed + epoch).shuffle(indices)
         indices = indices[:n_samples]
-        accumulated_loss = 0.0
-        progress = tqdm(indices, desc=f"epoch {epoch + 1}/{args.epochs}", unit="video")
-        for position, index in enumerate(progress, start=1):
-            chosen, chosen_start, rejected, rejected_start = prepare_pair(
-                processor, train_dataset[index], args, device
+        skip_samples = samples_seen_in_epoch if epoch == start_epoch else 0
+        if skip_samples > len(indices):
+            raise ValueError(
+                f"Resume non valido: {skip_samples} campioni gia visti, "
+                f"ma l'epoca ne contiene {len(indices)}"
             )
-            with model.disable_adapter(), torch.no_grad():
-                chosen_ref = completion_log_prob(model, chosen, chosen_start)
-                rejected_ref = completion_log_prob(model, rejected, rejected_start)
-            chosen_pol = completion_log_prob(model, chosen, chosen_start)
-            rejected_pol = completion_log_prob(model, rejected, rejected_start)
-            raw_loss = dpo_loss(chosen_pol, rejected_pol, chosen_ref, rejected_ref, args.beta)
-            chosen_tokens = chosen["input_ids"].shape[-1] - chosen_start
-            rejected_tokens = rejected["input_ids"].shape[-1] - rejected_start
-            policy_margin = (chosen_pol - rejected_pol).detach().item()
-            reference_margin = (chosen_ref - rejected_ref).item()
-            margin_delta = policy_margin - reference_margin
+        accumulated_loss = 0.0
+        progress = tqdm(
+            indices[skip_samples:], desc=f"epoch {epoch + 1}/{args.epochs}", unit="video"
+        )
+        for position, index in enumerate(progress, start=skip_samples + 1):
+            try:
+                inputs, completion_tokens = prepare_sft_example(
+                    processor, train_dataset[index], args, device
+                )
+                outputs = model(**inputs)
+                raw_loss = outputs.loss
+                (raw_loss / args.accum_steps).backward()
+            except torch.cuda.OutOfMemoryError as error:
+                # Video anomalo (troppi frame/token): si scarta il sample invece
+                # di far crashare l'intero job. Si libera subito la memoria
+                # residua e si azzerano eventuali gradienti parziali accumulati
+                # per questo sample prima di proseguire.
+                optimizer.zero_grad(set_to_none=True)
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                write_metric(
+                    metrics_file,
+                    run_id=run_id,
+                    record_type="sample",
+                    split="train",
+                    epoch=epoch + 1,
+                    sample_position=position,
+                    dataset_index=index,
+                    optimizer_step=global_step + 1,
+                    skipped_oom=True,
+                    error=str(error),
+                )
+                print(
+                    f"[WARN] OOM sul sample {index} (video_id="
+                    f"{train_dataset.records[index]['video_id']}): saltato.",
+                    file=__import__("sys").stderr,
+                )
+                continue
+
             write_metric(
                 metrics_file,
                 run_id=run_id,
@@ -683,16 +702,10 @@ def train(args):
                 sample_position=position,
                 dataset_index=index,
                 optimizer_step=global_step + 1,
-                chosen_completion_tokens=chosen_tokens,
-                rejected_completion_tokens=rejected_tokens,
-                policy_margin=policy_margin,
-                reference_margin=reference_margin,
-                preference_margin_delta=margin_delta,
-                dpo_logit=args.beta * margin_delta,
-                dpo_loss=raw_loss.detach().item(),
+                completion_tokens=completion_tokens,
+                sft_loss=raw_loss.detach().item(),
                 learning_rate=optimizer.param_groups[0]["lr"],
             )
-            (raw_loss / args.accum_steps).backward()
             accumulated_loss += raw_loss.item()
 
             if position % args.accum_steps == 0 or position == len(indices):
@@ -706,38 +719,26 @@ def train(args):
                 progress.set_postfix(step=global_step, loss=f"{shown_loss:.4f}")
                 if global_step % args.save_steps == 0:
                     checkpoint = save_dir / f"checkpoint-{global_step}"
-                    model.save_pretrained(checkpoint)
-                    processor.save_pretrained(checkpoint)
+                    save_checkpoint(checkpoint, epoch, position)
                     print(f"[checkpoint] salvato {checkpoint}")
-            del chosen, rejected, chosen_ref, rejected_ref, chosen_pol, rejected_pol, raw_loss
+            del inputs, outputs, raw_loss
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        accuracy, margin, video_metrics = evaluate(
+        video_metrics = evaluate(
             model, processor, val_dataset, args, device,
             metrics_file, run_id, epoch + 1,
         )
         checkpoint = save_dir / f"checkpoint-epoch{epoch + 1}"
-        model.save_pretrained(checkpoint)
-        processor.save_pretrained(checkpoint)
-        pairwise_summary = (
-            f"val_accuracy={accuracy:.4f} val_margin={margin:.4f}"
-            if accuracy is not None
-            else "pairwise_unavailable"
-        )
-        print(
-            f"[epoch {epoch + 1}] {pairwise_summary} "
-            f"F1_MEAN={video_metrics['f1_mean']:.4f}"
-        )
+        save_checkpoint(checkpoint, epoch + 1, 0)
+        print(f"[epoch {epoch + 1}] F1_MEAN={video_metrics['f1_mean']:.4f}")
         if video_metrics["f1_mean"] > best_f1_mean:
             best_f1_mean = video_metrics["f1_mean"]
             best = save_dir / "checkpoint-best"
-            model.save_pretrained(best)
-            processor.save_pretrained(best)
+            save_checkpoint(best, epoch + 1, 0)
 
     final_path = save_dir / "final"
-    model.save_pretrained(final_path)
-    processor.save_pretrained(final_path)
+    save_checkpoint(final_path, args.epochs, 0)
     metrics_file.close()
     print(f"[done] adapter finale salvato in {final_path}")
     print(f"[done] metriche salvate in {metrics_path}")
@@ -752,24 +753,33 @@ def positive_int(value):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="DPO Qwen2.5-VL su video e coppie di frame VideoXum"
+        description="SFT Qwen2.5-VL su video VideoXum usando le risposte 'chosen'"
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--data_json", type=Path, default=DEFAULT_DATA)
     parser.add_argument("--video_dir", type=Path, default=DEFAULT_VIDEO_DIR)
-    parser.add_argument("--val_json", type=Path)
-    parser.add_argument("--val_video_dir", type=Path)
+    parser.add_argument("--val_json", type=Path, default=DEFAULT_VAL_DATA)
+    parser.add_argument(
+        "--val_video_dir", type=Path, default=DEFAULT_VAL_VIDEO_DIR
+    )
     parser.add_argument("--val_ratio", type=float, default=0.05)
     parser.add_argument("--saveroot", type=Path, default=DEFAULT_SAVEROOT)
     parser.add_argument("--resultsroot", type=Path, default=DEFAULT_RESULTSROOT)
     parser.add_argument("--resume_from", type=Path)
+    parser.add_argument(
+        "--eval_only", action="store_true",
+        help="esegue soltanto la validation generativa di un adapter esistente",
+    )
+    parser.add_argument(
+        "--eval_checkpoint", type=Path,
+        help="directory del checkpoint PEFT/LoRA da usare con --eval_only",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--attn_impl", choices=("sdpa", "flash_attention_2"), default="sdpa")
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--epochs", type=positive_int, default=3)
     parser.add_argument("--accum_steps", type=positive_int, default=8)
-    parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument(
@@ -781,11 +791,16 @@ def parse_args():
         help="limite di sicurezza; 0 non tronca la timeline a 1 FPS",
     )
     parser.add_argument("--max_pixels", type=positive_int, default=256 * 28 * 28)
+    parser.add_argument(
+        "--min_pixels", type=positive_int, default=4 * 28 * 28,
+        help="Deve restare <= --max_pixels, altrimenti qwen_vl_utils solleva "
+             "AssertionError (vedi default interno VIDEO_MIN_PIXELS=128*28*28).",
+    )
     parser.add_argument("--lora_r", type=positive_int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--save_steps", type=positive_int, default=100)
     parser.add_argument("--eval_samples", type=int, default=200,
-                        help="numero di coppie di validation; <=0 usa tutto")
+                        help="numero di video di validation; <=0 usa tutto")
     parser.add_argument(
         "--eval_max_new_tokens", type=positive_int, default=256,
         help="token massimi per gli intervalli generati durante la validation",
@@ -797,4 +812,17 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    train(parse_args())
+    cli_args = parse_args()
+    if cli_args.min_pixels > cli_args.max_pixels:
+        raise SystemExit(
+            f"--min_pixels ({cli_args.min_pixels}) non puo' superare "
+            f"--max_pixels ({cli_args.max_pixels})"
+        )
+    if cli_args.eval_only:
+        if cli_args.eval_checkpoint is None:
+            raise SystemExit("--eval_only richiede --eval_checkpoint CHECKPOINT")
+        validate_only(cli_args)
+    elif cli_args.eval_checkpoint is not None:
+        raise SystemExit("--eval_checkpoint richiede --eval_only")
+    else:
+        train(cli_args)
