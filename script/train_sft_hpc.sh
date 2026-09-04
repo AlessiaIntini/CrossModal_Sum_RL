@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=videoxum_sft
+#SBATCH --job-name=sft-FlashAttention
 #SBATCH --partition=gpu_a40
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -9,8 +9,8 @@
 #SBATCH --mem=96G
 #SBATCH --time=24:00:00
 #SBATCH --chdir=/home/aintini/RL_VideoSum/GRPOVideo
-#SBATCH --output=/home/aintini/RL_VideoSum/GRPOVideo/logs/sft-%j.out
-#SBATCH --error=/home/aintini/RL_VideoSum/GRPOVideo/logs/sft-%j.err
+#SBATCH --output=/home/aintini/RL_VideoSum/GRPOVideo/logs/sft-FlashAttention-%j.out
+#SBATCH --error=/home/aintini/RL_VideoSum/GRPOVideo/logs/sft-FlashAttention-%j.err
 
 set -Eeuo pipefail
 trap 'rc=$?; echo "[ERROR] train_sft_hpc.sh: riga $LINENO, exit=$rc, comando: $BASH_COMMAND" >&2' ERR
@@ -25,8 +25,8 @@ MODEL_DIR="${MODEL_DIR:-$PROJECT_DIR/models/Qwen2.5-VL-7B-Instruct}"
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/metadata/derived/train_videoxum_dpo.json}"
 RAW_DATA_JSON="${RAW_DATA_JSON:-$DATA_ROOT/metadata/train_videoxum.json}"
 VAL_JSON="${VAL_JSON:-$DATA_ROOT/metadata/val_videoxum.json}"
-CHECKPOINT_ROOT="${SFT_CHECKPOINT_ROOT:-$PROJECT_DIR/outputs/sft/checkpoints}"
-RESULTS_ROOT="${SFT_RESULTS_ROOT:-$PROJECT_DIR/outputs/sft/results}"
+CHECKPOINT_ROOT="${SFT_CHECKPOINT_ROOT:-$PROJECT_DIR/outputs/sft_FlashAttention/checkpoints}"
+RESULTS_ROOT="${SFT_RESULTS_ROOT:-$PROJECT_DIR/outputs/sft_FlashAttention/results}"
 
 cd "$PROJECT_DIR"
 echo "==================================================================="
@@ -86,6 +86,7 @@ srun python -u sft_train_videoxum.py \
     --debug_samples "${SFT_TRAIN_SAMPLES:-4000}" \
     --eval_samples "${SFT_EVAL_SAMPLES:-1000}" \
     --max_pixels "${MAX_PIXELS:-100352}" --min_pixels "${MIN_PIXELS:-3136}" \
+    --attn_impl "flash_attention_2" \
     --max_frames 0 \
     --save_steps "${SAVE_STEPS:-100}" --device cuda:0 \
     "${EXTRA_ARGS[@]}"

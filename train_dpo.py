@@ -19,9 +19,10 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from qwen_vl_utils import process_vision_info
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor
 from transformers import get_cosine_schedule_with_warmup
 from utils import compute_kendall, compute_spearman
+from vl_model_loader import load_qwen_vl_model
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 VIDEOXUM_ROOT = PROJECT_ROOT / "dataset" / "aintini" / "datasets" / "videoxum"
@@ -560,12 +561,11 @@ def validate_only(args):
 
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"[model] caricamento offline del modello base {args.model}")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model,
-        local_files_only=True,
-        torch_dtype=dtype,
-        attn_implementation=args.attn_impl,
-    ).to(device)
+    model, model_type = load_qwen_vl_model(
+        args.model, torch_dtype=dtype, attn_implementation=args.attn_impl
+    )
+    model = model.to(device)
+    print(f"[model] architecture={model_type}")
     print(f"[model] caricamento adapter {args.eval_checkpoint}")
     model = PeftModel.from_pretrained(
         model, args.eval_checkpoint, is_trainable=False, local_files_only=True
@@ -618,12 +618,11 @@ def train(args):
 
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"[model] caricamento offline di {args.model}")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model,
-        local_files_only=True,
-        torch_dtype=dtype,
-        attn_implementation=args.attn_impl,
-    ).to(device)
+    model, model_type = load_qwen_vl_model(
+        args.model, torch_dtype=dtype, attn_implementation=args.attn_impl
+    )
+    model = model.to(device)
+    print(f"[model] architecture={model_type}")
     processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
     if args.resume_from:
         model = PeftModel.from_pretrained(
@@ -732,57 +731,124 @@ def train(args):
             indices[skip_samples:], desc=f"epoch {epoch + 1}/{args.epochs}", unit="video"
         )
         for position, index in enumerate(progress, start=skip_samples + 1):
-            chosen, chosen_start, rejected, rejected_start = prepare_pair(
-                processor, train_dataset[index], args, device
-            )
-            with model.disable_adapter(), torch.no_grad():
-                chosen_ref = completion_log_prob(model, chosen, chosen_start)
-                rejected_ref = completion_log_prob(model, rejected, rejected_start)
-            chosen_pol = completion_log_prob(model, chosen, chosen_start)
-            rejected_pol = completion_log_prob(model, rejected, rejected_start)
-            raw_loss = dpo_loss(chosen_pol, rejected_pol, chosen_ref, rejected_ref, args.beta)
-            chosen_tokens = chosen["input_ids"].shape[-1] - chosen_start
-            rejected_tokens = rejected["input_ids"].shape[-1] - rejected_start
-            policy_margin = (chosen_pol - rejected_pol).detach().item()
-            reference_margin = (chosen_ref - rejected_ref).item()
-            margin_delta = policy_margin - reference_margin
-            write_metric(
-                metrics_file,
-                run_id=run_id,
-                record_type="sample",
-                split="train",
-                epoch=epoch + 1,
-                sample_position=position,
-                dataset_index=index,
-                optimizer_step=global_step + 1,
-                chosen_completion_tokens=chosen_tokens,
-                rejected_completion_tokens=rejected_tokens,
-                policy_margin=policy_margin,
-                reference_margin=reference_margin,
-                preference_margin_delta=margin_delta,
-                dpo_logit=args.beta * margin_delta,
-                dpo_loss=raw_loss.detach().item(),
-                learning_rate=optimizer.param_groups[0]["lr"],
-            )
-            (raw_loss / args.accum_steps).backward()
-            accumulated_loss += raw_loss.item()
+            try:
+                chosen, chosen_start, rejected, rejected_start = prepare_pair(
+                    processor, train_dataset[index], args, device
+                )
+                with model.disable_adapter(), torch.no_grad():
+                    chosen_ref = completion_log_prob(model, chosen, chosen_start)
+                    rejected_ref = completion_log_prob(model, rejected, rejected_start)
+                # Conservare contemporaneamente i grafi autograd di chosen e rejected
+                # raddoppia quasi il picco di memoria sui video lunghi. Manteniamo il
+                # grafo chosen, misuriamo rejected senza grafo per ricavare il peso
+                # scalare della loss DPO, quindi eseguiamo i due backward in sequenza.
+                # Lo stato RNG viene ripristinato prima di ricalcolare rejected, così
+                # anche il dropout LoRA usa la stessa maschera del forward di misura.
+                chosen_pol = completion_log_prob(model, chosen, chosen_start)
+                cpu_rng_before_rejected = torch.get_rng_state()
+                cuda_rng_before_rejected = (
+                    torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+                )
+                with torch.no_grad():
+                    rejected_pol_value = completion_log_prob(
+                        model, rejected, rejected_start
+                    )
+                raw_loss = dpo_loss(
+                    chosen_pol.detach(), rejected_pol_value,
+                    chosen_ref, rejected_ref, args.beta,
+                )
+                chosen_tokens = chosen["input_ids"].shape[-1] - chosen_start
+                rejected_tokens = rejected["input_ids"].shape[-1] - rejected_start
+                policy_margin_tensor = chosen_pol.detach() - rejected_pol_value
+                policy_margin = policy_margin_tensor.item()
+                reference_margin = (chosen_ref - rejected_ref).item()
+                margin_delta = policy_margin - reference_margin
+                write_metric(
+                    metrics_file,
+                    run_id=run_id,
+                    record_type="sample",
+                    split="train",
+                    epoch=epoch + 1,
+                    sample_position=position,
+                    dataset_index=index,
+                    optimizer_step=global_step + 1,
+                    chosen_completion_tokens=chosen_tokens,
+                    rejected_completion_tokens=rejected_tokens,
+                    policy_margin=policy_margin,
+                    reference_margin=reference_margin,
+                    preference_margin_delta=margin_delta,
+                    dpo_logit=args.beta * margin_delta,
+                    dpo_loss=raw_loss.detach().item(),
+                    learning_rate=optimizer.param_groups[0]["lr"],
+                )
+                # Per L=-logsigmoid(beta * margin_delta):
+                # dL/d(chosen)= -beta*sigmoid(-beta*margin_delta)
+                # dL/d(rejected)=+beta*sigmoid(-beta*margin_delta)
+                backward_scale = (
+                    args.beta
+                    * torch.sigmoid(-args.beta * (
+                        policy_margin_tensor
+                        - (chosen_ref.detach() - rejected_ref.detach())
+                    ))
+                    / args.accum_steps
+                ).detach()
+                chosen_pol.backward(gradient=-backward_scale)
+                del chosen_pol
 
-            if position % args.accum_steps == 0 or position == len(indices):
-                torch.nn.utils.clip_grad_norm_(parameters, args.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
+                torch.set_rng_state(cpu_rng_before_rejected)
+                if cuda_rng_before_rejected is not None:
+                    torch.cuda.set_rng_state(cuda_rng_before_rejected, device)
+                rejected_pol = completion_log_prob(model, rejected, rejected_start)
+                rejected_pol.backward(gradient=backward_scale)
+                accumulated_loss += raw_loss.item()
+
+                if position % args.accum_steps == 0 or position == len(indices):
+                    torch.nn.utils.clip_grad_norm_(parameters, args.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+                    divisor = args.accum_steps if position % args.accum_steps == 0 else position % args.accum_steps
+                    shown_loss, accumulated_loss = accumulated_loss / divisor, 0.0
+                    progress.set_postfix(step=global_step, loss=f"{shown_loss:.4f}")
+                    if global_step % args.save_steps == 0:
+                        checkpoint = save_dir / f"checkpoint-{global_step}"
+                        save_checkpoint(checkpoint, epoch, position)
+                        print(f"[checkpoint] salvato {checkpoint}")
+                del (
+                    chosen, rejected, chosen_ref, rejected_ref, rejected_pol,
+                    rejected_pol_value, raw_loss, policy_margin_tensor,
+                    backward_scale, cpu_rng_before_rejected,
+                    cuda_rng_before_rejected,
+                )
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            except torch.cuda.OutOfMemoryError as error:
+                # Un video puo' richiedere piu' VRAM della GPU. I gradienti del
+                # campione parziale non sono utilizzabili: li scartiamo e
+                # proseguiamo, come avviene nella SFT.
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                divisor = args.accum_steps if position % args.accum_steps == 0 else position % args.accum_steps
-                shown_loss, accumulated_loss = accumulated_loss / divisor, 0.0
-                progress.set_postfix(step=global_step, loss=f"{shown_loss:.4f}")
-                if global_step % args.save_steps == 0:
-                    checkpoint = save_dir / f"checkpoint-{global_step}"
-                    save_checkpoint(checkpoint, epoch, position)
-                    print(f"[checkpoint] salvato {checkpoint}")
-            del chosen, rejected, chosen_ref, rejected_ref, chosen_pol, rejected_pol, raw_loss
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+                accumulated_loss = 0.0
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                write_metric(
+                    metrics_file,
+                    run_id=run_id,
+                    record_type="sample",
+                    split="train",
+                    epoch=epoch + 1,
+                    sample_position=position,
+                    dataset_index=index,
+                    optimizer_step=global_step + 1,
+                    skipped_oom=True,
+                    error=str(error),
+                )
+                print(
+                    f"[WARN] OOM sul sample {index} (video_id="
+                    f"{train_dataset.records[index]['video_id']}): saltato.",
+                    file=__import__("sys").stderr,
+                )
+                continue
 
         accuracy, margin, video_metrics = evaluate(
             model, processor, val_dataset, args, device,

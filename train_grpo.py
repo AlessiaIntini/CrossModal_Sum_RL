@@ -15,14 +15,15 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from qwen_vl_utils import process_vision_info
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor
 from transformers import get_cosine_schedule_with_warmup
 from grpo_rewards import SentenceTransformerEncoder, VideoSummaryReward
+from vl_model_loader import load_qwen_vl_model
 
-DEFAULT_MODEL = Path("/leonardo_work/IscrC_MSMU/aintini0/models/Qwen2.5-VL-3B-Instruct")
-DEFAULT_DATA = Path("/leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/metadata/derived/train_videoxum_dpo.json")
-DEFAULT_VIDEO_DIR = Path("/leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/train")
-DEFAULT_FEATURE_DIR = Path("/leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/feat/blip")
+DEFAULT_MODEL = Path("/home/aintini/RL_VideoSum/GRPOVideo/models/Qwen2.5-VL-7B-Instruct")
+DEFAULT_DATA = Path("/home/aintini/RL_VideoSum/GRPOVideo/dataset/aintini/datasets/videoxum/metadata/derived/train_videoxum_dpo.json")
+DEFAULT_VIDEO_DIR = Path("/home/aintini/RL_VideoSum/GRPOVideo/dataset/aintini/datasets/videoxum/train")
+DEFAULT_FEATURE_DIR = Path("/home/aintini/RL_VideoSum/GRPOVideo/dataset/aintini/datasets/videoxum/feat/blip")
 SYSTEM_PROMPT = "You are a video summarization assistant. Select representative frames and write one concise summary."
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
 
@@ -96,6 +97,12 @@ def ensure_reward_cache(engine, sample):
     if engine.has_video(sample["cache_key"]): return
     with np.load(sample["feature_path"]) as archive:
         features = archive["features"] if "features" in archive else archive[archive.files[0]]
+    # L'estrattore OpenCV puo' includere il frame finale del file, mentre il
+    # metadata VideoXum conta i frame sulla griglia [0, durata) a 1 fps. I file
+    # BLIP attuali hanno quindi talvolta esattamente una feature in piu'. Essa
+    # non appartiene ad alcun indice della timeline supervisionata e va rimossa.
+    if features.ndim == 2 and features.shape[0] == sample["count"] + 1:
+        features = features[:sample["count"]]
     engine.prepare_video(sample["cache_key"], count=sample["count"],
         vsum_onehot=sample["vsum_onehot"], vsum=sample["vsum"], tsum=sample["tsum"],
         frame_features=features)
@@ -135,9 +142,18 @@ def generate(model, inputs, processor, args, training=True):
     kwargs = dict(max_new_tokens=args.max_completion_length, do_sample=training,
                   num_return_sequences=args.num_generations if training else 1, use_cache=True)
     if training: kwargs.update(temperature=args.temperature, top_p=args.top_p)
+    # Alcune versioni di Transformers estendono attention_mask durante
+    # generate(). Conserviamo quindi gli input del prompt immutati: gli stessi
+    # tensor sono riutilizzati da token_logps per il backward GRPO.
+    def generate_from_prompt():
+        generation_inputs = {
+            key: value.clone() if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        }
+        return model.generate(**generation_inputs, **kwargs)
     try:
         try:
-            sequences = model.generate(**inputs, **kwargs)
+            sequences = generate_from_prompt()
             ids = [row[prompt_len:].detach() for row in sequences]
         except torch.OutOfMemoryError:
             if not training or args.num_generations == 1:
@@ -147,7 +163,7 @@ def generate(model, inputs, processor, args, training=True):
             kwargs["num_return_sequences"] = 1
             ids = []
             for _ in range(args.num_generations):
-                sequences = model.generate(**inputs, **kwargs)
+                sequences = generate_from_prompt()
                 ids.append(sequences[0, prompt_len:].detach())
                 del sequences
                 torch.cuda.empty_cache()
@@ -215,7 +231,7 @@ def train(args):
     torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
     if not args.model.is_dir(): raise FileNotFoundError(f"modello base non trovato: {args.model}")
     if args.init_from is not None and not args.init_from.is_dir():
-        raise FileNotFoundError(f"checkpoint DPO non trovato: {args.init_from}")
+        raise FileNotFoundError(f"checkpoint PEFT iniziale non trovato: {args.init_from}")
     if args.device.startswith("cuda") and not torch.cuda.is_available(): raise RuntimeError("CUDA non disponibile")
     device = torch.device(args.device)
     train_set, val_set = load_datasets(args)
@@ -226,16 +242,22 @@ def train(args):
     log = (result_dir/f"metrics-{run_id}.jsonl").open("w",encoding="utf-8",buffering=1)
     write_metric(log, run_id=run_id, record_type="config", arguments=vars(args))
     dtype = torch.bfloat16 if device.type=="cuda" else torch.float32
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(args.model,local_files_only=True,
-        torch_dtype=dtype,attn_implementation=args.attn_impl).to(device)
+    model, model_type = load_qwen_vl_model(
+        args.model, torch_dtype=dtype, attn_implementation=args.attn_impl
+    )
+    model = model.to(device)
+    print(f"[model] architecture={model_type}")
     processor = AutoProcessor.from_pretrained(args.model,local_files_only=True)
     if args.init_from is not None:
         model = PeftModel.from_pretrained(
             model, args.init_from, is_trainable=False, local_files_only=True
         ).merge_and_unload()
-        print(f"[model] warm-start e reference KL dal checkpoint DPO: {args.init_from}")
+        print(
+            f"[model] warm-start e reference KL dal checkpoint PEFT: "
+            f"{args.init_from}"
+        )
     else:
-        print("[model] nessun checkpoint DPO: warm-start e reference KL dal modello base")
+        print("[model] nessun checkpoint PEFT: warm-start e reference KL dal modello base")
     if args.resume_from:
         model = PeftModel.from_pretrained(model,args.resume_from,is_trainable=True,local_files_only=True)
     else:
@@ -247,6 +269,7 @@ def train(args):
     optimizer=torch.optim.AdamW(parameters,lr=args.lr,weight_decay=.01)
     requested_train_samples = args.train_samples or args.debug_samples
     train_indices = subset_indices(len(train_set), requested_train_samples, args.seed)
+    val_indices = subset_indices(len(val_set), args.val_samples or args.debug_samples, args.seed)
     n = len(train_indices)
     print(f"[data] training={n}/{len(train_set)}, validation={min(args.val_samples, len(val_set)) if args.val_samples else len(val_set)}/{len(val_set)}")
     steps=math.ceil(n/args.accum_steps)*args.epochs
@@ -299,7 +322,7 @@ def parse_args():
     p=argparse.ArgumentParser(description="GRPO VideoXum: selected_frames + summary")
     p.add_argument("--model",type=Path,default=DEFAULT_MODEL)
     p.add_argument("--init_from",type=Path,
-        help="checkpoint DPO opzionale; se omesso GRPO parte dal modello base")
+        help="adapter PEFT SFT/DPO opzionale; se omesso GRPO parte dal modello base")
     p.add_argument("--resume_from",type=Path); p.add_argument("--data_json",type=Path,default=DEFAULT_DATA)
     p.add_argument("--video_dir",type=Path,default=DEFAULT_VIDEO_DIR); p.add_argument("--feature_dir",type=Path,default=DEFAULT_FEATURE_DIR)
     p.add_argument("--val_json",type=Path); p.add_argument("--val_video_dir",type=Path); p.add_argument("--val_feature_dir",type=Path)

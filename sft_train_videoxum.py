@@ -20,9 +20,10 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from qwen_vl_utils import process_vision_info
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor
 from transformers import get_cosine_schedule_with_warmup
 from utils import compute_kendall, compute_spearman
+from vl_model_loader import load_qwen_vl_model
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 VIDEOXUM_ROOT = PROJECT_ROOT / "dataset" / "aintini" / "datasets" / "videoxum"
@@ -488,12 +489,11 @@ def validate_only(args):
 
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"[model] caricamento offline del modello base {args.model}")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model,
-        local_files_only=True,
-        torch_dtype=dtype,
-        attn_implementation=args.attn_impl,
-    ).to(device)
+    model, model_type = load_qwen_vl_model(
+        args.model, torch_dtype=dtype, attn_implementation=args.attn_impl
+    )
+    model = model.to(device)
+    print(f"[model] architecture={model_type}")
     print(f"[model] caricamento adapter {args.eval_checkpoint}")
     model = PeftModel.from_pretrained(
         model, args.eval_checkpoint, is_trainable=False, local_files_only=True
@@ -546,12 +546,11 @@ def train(args):
 
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"[model] caricamento offline di {args.model}")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model,
-        local_files_only=True,
-        torch_dtype=dtype,
-        attn_implementation=args.attn_impl,
-    ).to(device)
+    model, model_type = load_qwen_vl_model(
+        args.model, torch_dtype=dtype, attn_implementation=args.attn_impl
+    )
+    model = model.to(device)
+    print(f"[model] architecture={model_type}")
     processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
     if args.resume_from:
         model = PeftModel.from_pretrained(
