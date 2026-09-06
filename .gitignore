@@ -9,4 +9,4 @@ train_videoxum_medoid.json
 dataset/
 temp/
 models/
-logs/
+logs/*.whl

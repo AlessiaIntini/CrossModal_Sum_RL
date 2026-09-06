@@ -232,8 +232,31 @@ def build_messages(sample, args, response=None, video_frames=None):
         })
     return messages
 
+def process_video_inputs(messages, model_type):
+    if model_type == "qwen3_vl":
+        images, videos, video_kwargs = process_vision_info(
+            messages,
+            image_patch_size=16,
+            return_video_kwargs=True,
+            return_video_metadata=True,
+        )
 
-def prepare_completion(processor, sample, response, args, video_frames=None):
+        if videos is not None:
+            videos, video_metadata = zip(*videos)
+            videos = list(videos)
+            video_kwargs["video_metadata"] = list(video_metadata)
+
+        return images, videos, video_kwargs
+
+    images, videos = process_vision_info(
+        messages,
+        image_patch_size=14,
+    )
+    return images, videos, {}
+
+def prepare_completion(
+    processor, sample, response, args, model_type, video_frames=None
+):
     """Decodifica il video una volta e trova l'inizio esatto della completion."""
     prompt_messages = build_messages(sample, args, video_frames=video_frames)
     full_messages = build_messages(sample, args, response, video_frames=video_frames)
@@ -243,8 +266,18 @@ def prepare_completion(processor, sample, response, args, video_frames=None):
     full_text = processor.apply_chat_template(
         full_messages, tokenize=False, add_generation_prompt=False
     )
-    images, videos = process_vision_info(prompt_messages)
-    common = dict(images=images, videos=videos, padding=False, return_tensors="pt", cap_pixels_per_frame=True)
+    images, videos, video_kwargs = process_video_inputs(
+        prompt_messages, model_type
+    )
+
+    common = dict(
+    images=images,
+    videos=videos,
+    padding=False,
+    return_tensors="pt",
+    cap_pixels_per_frame=True,
+    **video_kwargs,
+    )
     prompt_inputs = processor(text=[prompt_text], **common)
     full_inputs = processor(text=[full_text], **common)
     prompt_ids = prompt_inputs["input_ids"][0]
@@ -264,11 +297,13 @@ def move_inputs(inputs, device):
     }
 
 
-def prepare_sft_example(processor, sample, args, device, video_frames=None):
+def prepare_sft_example(
+    processor, sample, args, device, model_type, video_frames=None
+):
     """Prepara input_ids + labels (prompt mascherato a -100) per la CE loss."""
     frames = video_frames if video_frames is not None else decode_video_frames(sample, args)
     full_inputs, prompt_len = prepare_completion(
-        processor, sample, sample["target"], args, frames
+        processor, sample, sample["target"], args, model_type, frames
     )
     labels = full_inputs["input_ids"].clone()
     labels[:, :prompt_len] = -100
@@ -342,17 +377,19 @@ def videoxum_metrics(prediction, references):
     }
 
 
-def generate_interval_response(model, processor, sample, args, device, frames):
+def generate_interval_response(
+    model, processor, sample, args, device, frames, model_type
+):
     """Genera gli intervalli dal solo video e prompt, senza teacher forcing."""
     messages = build_messages(sample, args, video_frames=frames)
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    images, videos = process_vision_info(messages)
+    images, videos, video_kwargs = process_video_inputs(messages, model_type)
     inputs = processor(
         text=[text], images=images, videos=videos,
         padding=False, return_tensors="pt",
-        cap_pixels_per_frame=True
+        cap_pixels_per_frame=True, **video_kwargs
     )
     inputs = move_inputs(inputs, device)
     prompt_length = inputs["input_ids"].shape[-1]
@@ -371,7 +408,10 @@ def generate_interval_response(model, processor, sample, args, device, frames):
 
 
 @torch.no_grad()
-def evaluate(model, processor, dataset, args, device, metrics_file, run_id, epoch):
+def evaluate(
+    model, processor, dataset, args, device, metrics_file, run_id, epoch,
+    model_type,
+):
     model.eval()
     limit = len(dataset) if args.eval_samples <= 0 else min(args.eval_samples, len(dataset))
     invalid_predictions = 0
@@ -382,7 +422,7 @@ def evaluate(model, processor, dataset, args, device, metrics_file, run_id, epoc
         sample = dataset[index]
         frames = decode_video_frames(sample, args)
         response = generate_interval_response(
-            model, processor, sample, args, device, frames
+            model, processor, sample, args, device, frames, model_type
         )
         parse_error = None
         try:
@@ -405,7 +445,8 @@ def evaluate(model, processor, dataset, args, device, metrics_file, run_id, epoc
             epoch=epoch,
             sample_position=index + 1,
             dataset_index=index,
-            generated_response=response,
+                generated_response=response,
+                model_type=model_type,
             prediction_valid=parse_error is None,
             parse_error=parse_error,
             selected_frames=sum(prediction),
@@ -514,7 +555,7 @@ def validate_only(args):
         )
         evaluate(
             model, processor, val_dataset, args, device,
-            metrics_file, run_id, epoch=0,
+            metrics_file, run_id, epoch=0, model_type=model_type,
         )
     print(f"[done] validation checkpoint {args.eval_checkpoint}")
     print(f"[done] metriche salvate in {metrics_path}")
@@ -565,10 +606,10 @@ def train(args):
             bias="none",
             task_type="CAUSAL_LM",
         ))
+    model.config.use_cache = False
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
-    model.config.use_cache = False
     model.enable_input_require_grads()
     model.print_trainable_parameters()
 
@@ -660,7 +701,7 @@ def train(args):
         for position, index in enumerate(progress, start=skip_samples + 1):
             try:
                 inputs, completion_tokens = prepare_sft_example(
-                    processor, train_dataset[index], args, device
+                    processor, train_dataset[index], args, device, model_type
                 )
                 outputs = model(**inputs)
                 raw_loss = outputs.loss
@@ -726,7 +767,7 @@ def train(args):
 
         video_metrics = evaluate(
             model, processor, val_dataset, args, device,
-            metrics_file, run_id, epoch + 1,
+            metrics_file, run_id, epoch + 1, model_type,
         )
         checkpoint = save_dir / f"checkpoint-epoch{epoch + 1}"
         save_checkpoint(checkpoint, epoch + 1, 0)

@@ -11,3 +11,4 @@ pillow==12.3.0
 tqdm==4.70.0
 scikit-learn
 scipy
+opencv-python-headless>=4.10

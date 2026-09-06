@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --account=IscrC_MSMU
+#SBATCH --account=IscrC_HydroFM
 #SBATCH --partition=lrd_all_serial
 #SBATCH --job-name=videoxum_metadata
 #SBATCH --time=00:30:00
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4G
 #SBATCH --gres=tmpfs:10g
-#SBATCH --output=/leonardo_scratch/fast/IscrC_MSMU/aintini0/GRPOVideo/logs/videoxum-metadata-%j.out
-#SBATCH --error=/leonardo_scratch/fast/IscrC_MSMU/aintini0/GRPOVideo/logs/videoxum-metadata-%j.err
+#SBATCH --output=/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/logs/videoxum-metadata-%j.out
+#SBATCH --error=/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/logs/videoxum-metadata-%j.err
 
 set -euo pipefail
 

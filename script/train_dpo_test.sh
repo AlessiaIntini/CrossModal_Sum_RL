@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account=IscrC_MSMU
+#SBATCH --account=IscrC_HydroFM
 #SBATCH --partition=boost_usr_prod
 #SBATCH --job-name=videoxum_dpo_test
 #SBATCH --nodes=1
@@ -9,16 +9,16 @@
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
 #SBATCH --chdir=/leonardo/home/userexternal/aintini0/GRPOVideo
-#SBATCH --output=/leonardo_scratch/fast/IscrC_MSMU/aintini0/GRPOVideo/logs/dpo-%j.out
-#SBATCH --error=/leonardo_scratch/fast/IscrC_MSMU/aintini0/GRPOVideo/logs/dpo-%j.err
+#SBATCH --output=/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/logs/dpo-%j.out
+#SBATCH --error=/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/logs/dpo-%j.err
 
 set -euo pipefail
 
 PROJECT_DIR="/leonardo/home/userexternal/aintini0/GRPOVideo"
-VENV_DIR="/leonardo_scratch/fast/IscrC_MSMU/aintini0/venvs/grpovideo"
-CHECKPOINT_ROOT="/leonardo_scratch/fast/IscrC_MSMU/aintini0/GRPOVideo/checkpoints-test"
-RESULTS_ROOT="/leonardo_work/IscrC_MSMU/aintini0/GRPOVideo/results/dpo-test"
-DATA_JSON="/leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/metadata/derived/train_videoxum_dpo.json"
+VENV_DIR="/leonardo_scratch/fast/IscrC_HydroFM/aintini0/venvs/grpovideo"
+CHECKPOINT_ROOT="/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/checkpoints-test"
+RESULTS_ROOT="/leonardo_work/IscrC_HydroFM/aintini0/GRPOVideo/results/dpo-test"
+DATA_JSON="/leonardo_work/IscrC_HydroFM/aintini0/datasets/videoxum/metadata/derived/train_videoxum_dpo.json"
 
 cd "$PROJECT_DIR"
 module load python/3.11.7
@@ -50,8 +50,8 @@ fi
 
 srun python -u train_dpo.py \
     --data_json "$DATA_JSON" \
-    --val_json /leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/metadata/val_videoxum.json \
-    --val_video_dir /leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/val \
+    --val_json /leonardo_work/IscrC_HydroFM/aintini0/datasets/videoxum/metadata/val_videoxum.json \
+    --val_video_dir /leonardo_work/IscrC_HydroFM/aintini0/datasets/videoxum/val \
     --saveroot "$CHECKPOINT_ROOT" \
     --resultsroot "$RESULTS_ROOT" \
     --debug_samples 4000 \
@@ -70,5 +70,5 @@ srun python -u train_dpo.py \
     --fps 1 \
     --max_frames 0 \
     --device cuda:0 \
-    --resume_from /leonardo_scratch/fast/IscrC_MSMU/aintini0/GRPOVideo/checkpoints-test/Qwen2.5-VL-3B-Instruct/checkpoint-180 \
+    --resume_from /leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/checkpoints-test/Qwen2.5-VL-3B-Instruct/checkpoint-180 \
     "${MODE_ARGS[@]}"

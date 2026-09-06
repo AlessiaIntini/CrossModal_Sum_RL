@@ -19,11 +19,11 @@ from typing import Any, Sequence
 
 
 DEFAULT_INPUT = Path(
-    "/leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/metadata/"
+    "/leonardo_work/IscrC_HydroFM/aintini0/datasets/videoxum/metadata/"
     "train_videoxum.json"
 )
 DEFAULT_OUTPUT = Path(
-    "/leonardo_work/IscrC_MSMU/aintini0/datasets/videoxum/metadata/derived/"
+    "/leonardo_work/IscrC_HydroFM/aintini0/datasets/videoxum/metadata/derived/"
     "train_videoxum_dpo.json"
 )
 

@@ -227,7 +227,7 @@ def run_inference(args):
             try:
                 frames = decode_video_frames(sample, args)
                 response = generate_interval_response(
-                    model, processor, sample, args, device, frames
+                    model, processor, sample, args, device, frames, model_type
                 )
                 parse_error = None
                 try:
