@@ -54,6 +54,7 @@ nvidia-smi
 srun python -c 'import sys, torch; print(f"[INFO] torch={torch.__version__} cuda_build={torch.version.cuda} cuda_available={torch.cuda.is_available()}"); sys.exit(0 if torch.cuda.is_available() else "PyTorch non riesce a inizializzare CUDA")'
 
 srun python -u infer_sft_videoxum.py \
+    --mode sft \
     --model "$MODEL_DIR" \
     --checkpoint "$CHECKPOINT" \
     --test_json "$TEST_JSON" \

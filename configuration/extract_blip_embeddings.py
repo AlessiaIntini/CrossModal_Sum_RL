@@ -4,35 +4,35 @@ extract_blip_embeddings.py
 
 Estrae embedding visivi con BLIP dai video del dataset VideoXum.
 
-Per ogni video:
-  1. Campiona i frame a intervalli regolari (per FPS target o numero fisso di frame)
-  2. Calcola l'embedding BLIP di ogni frame campionato
-  3. Salva:
-       - gli embedding per-frame (array [n_frame, dim])
-       - l'embedding aggregato del video (mean pooling sui frame, [dim])
+Per ogni video, guidato da --metadata_json (stesso file con "sampled_frames"
+letto da DPO/SFT/train_grpo.py):
+  1. Decodifica 'sampled_frames' frame, un frame al secondo via
+     timestamp reali (av), identico a decode_frames() in train_grpo.py: questo
+     garantisce che l'output abbia sempre shape [count, D], senza i mismatch
+     occasionali del vecchio campionamento OpenCV (fps/total_frames del
+     container, non affidabile su framerate variabile). Se il file termina
+     leggermente prima dei metadata, ripete l'ultimo frame disponibile.
+  2. Calcola l'embedding BLIP di ogni frame (vision_model.pooler_output, non
+     la visual_projection contrastiva - non addestrata in questo checkpoint).
+  3. Salva "features" [count, D] e "video_embedding" [D] in un .npz.
 
-Uso tipico:
+Uso:
     python extract_blip_embeddings.py \
-        --video_dir /path/to/videoxum/videos \
-        --output_dir /path/to/output/embeddings \
-        --sample_fps 1.0
-
-oppure con un numero fisso di frame per video:
-    python extract_blip_embeddings.py \
-        --video_dir /path/to/videoxum/videos \
-        --output_dir /path/to/output/embeddings \
-        --num_frames 16
+        --metadata_json /path/to/train_videoxum.json \
+        --video_dir /path/to/videoxum/train \
+        --output_dir /path/to/output/embeddings
 
 Requisiti:
-    pip install torch transformers opencv-python numpy tqdm
+    pip install torch transformers av numpy tqdm
 """
 
 import argparse
+import json
 import os
 import sys
-import glob
+import tempfile
 import numpy as np
-import cv2
+import av
 import torch
 from tqdm import tqdm
 from transformers import BlipForConditionalGeneration, BlipProcessor
@@ -43,78 +43,81 @@ VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".webm")
 
 def parse_args():
     p = argparse.ArgumentParser(description="Estrae embedding BLIP dai video di VideoXum")
+    p.add_argument("--metadata_json", type=str, required=True,
+                    help="JSON con video_id -> sampled_frames (stesso file letto da "
+                         "DPO/SFT/train_grpo.py). Il 'count' di ogni video guida "
+                         "l'estrazione: garantisce che 'features' abbia sempre "
+                         "shape [count, D], eliminando i mismatch occasionali con "
+                         "prepare_video() causati dal vecchio campionamento OpenCV "
+                         "indipendente (fps/total_frames del container).")
     p.add_argument("--video_dir", type=str, required=True,
-                    help="Cartella contenente i video di VideoXum (ricerca ricorsiva).")
+                    help="Cartella contenente i video di VideoXum.")
     p.add_argument("--output_dir", type=str, required=True,
                     help="Cartella dove salvare gli embedding (.npz per video).")
     p.add_argument("--model_name", type=str, default="Salesforce/blip-image-captioning-base",
                     help="Nome/percorso del modello BLIP su HuggingFace Hub.")
-
-    sampling = p.add_mutually_exclusive_group()
-    sampling.add_argument("--sample_fps", type=float, default=1.0,
-                           help="Frame al secondo da campionare (default: 1.0). "
-                                "Ignorato se --num_frames è specificato.")
-    sampling.add_argument("--num_frames", type=int, default=None,
-                           help="Numero fisso di frame equispaziati da estrarre per video "
-                                "(sovrascrive --sample_fps).")
-
     p.add_argument("--batch_size", type=int, default=32,
                     help="Numero di frame processati insieme dal modello.")
     p.add_argument("--device", type=str, default=None,
                     help="cuda / cpu / mps. Default: auto-detect.")
-    p.add_argument("--save_per_frame", action="store_true", default=True,
-                    help="Salva anche gli embedding per singolo frame (default: True).")
-    p.add_argument("--no_save_per_frame", action="store_false", dest="save_per_frame",
-                    help="Salva solo l'embedding aggregato del video, non i singoli frame.")
     p.add_argument("--overwrite", action="store_true",
                     help="Ricalcola anche se il file di output esiste già.")
+    p.add_argument("--shard-index", type=int, default=0,
+                    help="Indice zero-based dello shard da elaborare (default: 0).")
+    p.add_argument("--shard-count", type=int, default=1,
+                    help="Numero totale di shard disgiunti (default: 1).")
     return p.parse_args()
 
 
-def find_videos(video_dir):
-    paths = []
-    for ext in VIDEO_EXTENSIONS:
-        paths.extend(glob.glob(os.path.join(video_dir, "**", f"*{ext}"), recursive=True))
-    return sorted(paths)
+def load_counts(path):
+    """Legge {video_id: count} dallo stesso JSON di metadata usato da DPO/SFT/GRPO."""
+    with open(path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    items = payload.items() if isinstance(payload, dict) else enumerate(payload)
+    counts = {}
+    for key, record in items:
+        if "sampled_frames" not in record:
+            raise ValueError(f"Record {key!r}: manca 'sampled_frames'")
+        video_id = str(record.get("video_id", key))
+        counts[video_id] = int(record["sampled_frames"])
+    if not counts:
+        raise ValueError(f"Nessun record in {path}")
+    return counts
 
 
-def sample_frame_indices(total_frames, fps, sample_fps=None, num_frames=None):
-    """Restituisce gli indici dei frame da estrarre."""
-    if total_frames <= 0:
-        return []
-
-    if num_frames is not None:
-        if total_frames <= num_frames:
-            return list(range(total_frames))
-        return np.linspace(0, total_frames - 1, num_frames).astype(int).tolist()
-
-    # campionamento per fps target
-    if fps <= 0:
-        fps = 25.0  # fallback ragionevole se il video non riporta fps validi
-    step = max(1, round(fps / sample_fps))
-    return list(range(0, total_frames, step))
+def resolve_video(video_dir, video_id):
+    direct = os.path.join(video_dir, video_id)
+    if os.path.isfile(direct):
+        return direct
+    for extension in VIDEO_EXTENSIONS:
+        candidate = os.path.join(video_dir, f"{video_id}{extension}")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
-def read_frames(video_path, indices):
-    """Legge dal video solo i frame agli indici richiesti (in ordine crescente)."""
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    idx_set = sorted(set(indices))
-    idx_iter = iter(idx_set)
-    target = next(idx_iter, None)
-    current = 0
-
-    while target is not None:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if current == target:
-            # BGR -> RGB per BLIP/PIL
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            target = next(idx_iter, None)
-        current += 1
-
-    cap.release()
+def decode_frames(video_path, expected):
+    """IDENTICA alla decode_frames() di train_grpo.py: av, timestamp-based,
+    1 frame/secondo, si ferma esattamente a 'expected' frame. Usare qualunque
+    altra logica (es. la vecchia basata su fps/total_frames di OpenCV) puo'
+    produrre un conteggio diverso da 'expected' su video con framerate
+    variabile o metadata container imprecisi, causando il mismatch di shape
+    in prepare_video()."""
+    frames, first, next_second = [], None, 0
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        for frame in container.decode(stream):
+            if frame.pts is None:
+                continue
+            ts = float(frame.pts * frame.time_base)
+            if first is None:
+                first = ts
+            if ts - first + 1e-6 >= next_second:
+                # BLIP/PIL vogliono RGB; frame.to_image() di PyAV lo restituisce gia' cosi'.
+                frames.append(frame.to_image())
+                next_second += 1
+                if len(frames) == expected:
+                    break
     return frames
 
 
@@ -140,35 +143,33 @@ def embed_frames(frames, processor, model, device, batch_size):
     return np.concatenate(all_embeds, axis=0)
 
 
-def process_video(video_path, args, processor, model, device):
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    cap.release()
+def process_video(video_path, expected, processor, model, device, batch_size):
+    frames = decode_frames(video_path, expected)
+    n_decoded = len(frames)
+    if n_decoded == 0:
+        # Non esiste un ultimo frame sensato da usare come padding: il file e'
+        # vuoto, corrotto o non decodificabile e richiede un intervento reale.
+        return None, n_decoded
+    if n_decoded < expected:
+        # I metadata VideoXum definiscono la timeline supervisionata. Quando il
+        # container termina prima, estendiamo l'ultima immagine: in questo modo
+        # non perdiamo il campione e features/label conservano gli stessi indici.
+        frames.extend([frames[-1]] * (expected - n_decoded))
 
-    indices = sample_frame_indices(
-        total_frames, fps,
-        sample_fps=args.sample_fps,
-        num_frames=args.num_frames,
-    )
-    if not indices:
-        print(f"[WARN] Nessun frame leggibile per {video_path}, salto.", file=sys.stderr)
-        return None
-
-    frames = read_frames(video_path, indices)
-    if not frames:
-        print(f"[WARN] Lettura frame fallita per {video_path}, salto.", file=sys.stderr)
-        return None
-
-    per_frame_embeds = embed_frames(frames, processor, model, device, args.batch_size)
+    per_frame_embeds = embed_frames(frames, processor, model, device, batch_size)
     video_embed = per_frame_embeds.mean(axis=0)
     video_embed = video_embed / (np.linalg.norm(video_embed) + 1e-8)
-
-    return per_frame_embeds, video_embed, indices
+    return (per_frame_embeds, video_embed), n_decoded
 
 
 def main():
     args = parse_args()
+    if args.shard_count < 1:
+        raise ValueError("--shard-count deve essere almeno 1")
+    if not 0 <= args.shard_index < args.shard_count:
+        raise ValueError(
+            "--shard-index deve essere compreso tra 0 e shard-count - 1"
+        )
     os.makedirs(args.output_dir, exist_ok=True)
 
     device = args.device or ("cuda" if torch.cuda.is_available()
@@ -185,51 +186,106 @@ def main():
     del captioning_model  # il decoder testuale non serve per feature visuali
     model.eval()
 
-    videos = find_videos(args.video_dir)
-    if not videos:
-        print(f"[ERRORE] Nessun video trovato in {args.video_dir}", file=sys.stderr)
-        sys.exit(1)
-    print(f"[INFO] Trovati {len(videos)} video.")
+    counts = load_counts(args.metadata_json)
+    all_items = list(counts.items())
+    shard_items = all_items[args.shard_index::args.shard_count]
+    print(
+        f"[INFO] {len(all_items)} video nei metadata; shard "
+        f"{args.shard_index + 1}/{args.shard_count}: {len(shard_items)} video."
+    )
 
-    for video_path in tqdm(videos, desc="Estrazione embedding"):
-        video_id = os.path.splitext(os.path.basename(video_path))[0]
+    n_ok, n_skip_compatible, n_padded, n_undecodable, n_missing = 0, 0, 0, 0, 0
+    for video_id, expected in tqdm(
+        shard_items, desc=f"Estrazione embedding shard {args.shard_index + 1}/{args.shard_count}"
+    ):
         out_path = os.path.join(args.output_dir, f"{video_id}.npz")
 
         if os.path.exists(out_path) and not args.overwrite:
-            # I file prodotti dalla vecchia versione avevano solo
-            # "frame_embeddings" ed erano basati su una proiezione casuale.
-            # Vengono rigenerati automaticamente; quelli nuovi si possono saltare.
+            # I file prodotti dalla vecchia versione (campionamento OpenCV
+            # indipendente e/o BlipModel con visual_projection random) vanno
+            # rigenerati: controlliamo sia il modello sia lo shape[0]==count.
             try:
                 with np.load(out_path) as existing:
                     compatible = (
                         "features" in existing
                         and existing["features"].ndim == 2
+                        and existing["features"].shape[0] == expected
                         and str(existing.get("encoder", "")) == args.model_name
                     )
                 if compatible:
+                    n_skip_compatible += 1
                     continue
                 print(f"[INFO] Rigenero file legacy/incompatibile: {out_path}")
             except (OSError, ValueError):
                 print(f"[INFO] Rigenero file non leggibile: {out_path}")
 
-        result = process_video(video_path, args, processor, model, device)
-        if result is None:
+        video_path = resolve_video(args.video_dir, video_id)
+        if video_path is None:
+            print(f"[WARN] Video mancante per {video_id}, salto.", file=sys.stderr)
+            n_missing += 1
             continue
 
-        per_frame_embeds, video_embed, indices = result
+        result, n_decoded = process_video(
+            video_path, expected, processor, model, device, args.batch_size
+        )
+        if result is None:
+            print(
+                f"[WARN] {video_id}: nessun frame decodificabile; impossibile "
+                "creare gli embedding. Salto.",
+                file=sys.stderr,
+            )
+            n_undecodable += 1
+            if os.path.exists(out_path):
+                # Non lasciare in giro la cache legacy con shape sbagliata: senza
+                # questo, un video genuinamente troncato continuerebbe a far
+                # scattare lo stesso ValueError in prepare_video() ad ogni
+                # riesecuzione dello script, anche dopo il fix del campionamento.
+                os.remove(out_path)
+                print(f"[INFO] Rimosso file stantio: {out_path}", file=sys.stderr)
+            continue
 
+        if n_decoded < expected:
+            print(
+                f"[WARN] {video_id}: estratti {n_decoded} frame, attesi "
+                f"{expected}; aggiungo {expected - n_decoded} copie "
+                "dell'ultimo frame.",
+                file=sys.stderr,
+            )
+            n_padded += 1
+
+        per_frame_embeds, video_embed = result
         save_kwargs = {
             # Nome consumato direttamente da train_grpo.py.
             "features": per_frame_embeds.astype(np.float32),
             "video_embedding": video_embed.astype(np.float32),
-            "frame_indices": np.array(indices, dtype=np.int64),
             "encoder": np.array(args.model_name),
-            "sample_fps": np.array(args.sample_fps, dtype=np.float32),
+            "count": np.array(expected, dtype=np.int64),
         }
+        # Scrittura atomica: un timeout/cancel non lascia un .npz parziale.
+        with tempfile.NamedTemporaryFile(
+            dir=args.output_dir, prefix=f".{video_id}.", suffix=".npz", delete=False
+        ) as temporary:
+            temporary_path = temporary.name
+        try:
+            np.savez_compressed(temporary_path, **save_kwargs)
+            os.replace(temporary_path, out_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        n_ok += 1
 
-        np.savez_compressed(out_path, **save_kwargs)
-
-    print(f"[INFO] Fatto. Embedding salvati in: {args.output_dir}")
+    print(
+        f"[DONE] generati={n_ok} gia_compatibili={n_skip_compatible} "
+        f"video_padded={n_padded} non_decodificabili={n_undecodable} "
+        f"video_mancanti={n_missing} "
+        f"totale_shard={len(shard_items)}"
+    )
+    if n_undecodable:
+        print(
+            "[NOTE] I video senza alcun frame decodificabile richiedono il "
+            "ripristino o la sostituzione del file sorgente.",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

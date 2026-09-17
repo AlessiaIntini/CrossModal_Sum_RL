@@ -2,8 +2,8 @@
 """Calcola chosen e rejected VideoXum per il training DPO.
 
 Per ogni video, ``vsum_onehot`` contiene 10 annotazioni binarie, una per
-frame. Il chosen e' il medoid temporale; il rejected ha lo stesso numero di
-frame selezionati ed e' creato con difficolta' intermedia oppure difficile.
+ frame. Il chosen e' il medoid temporale; il rejected e' creato con difficolta'
+ intermedia, difficile oppure con over-coverage (molti frame extra).
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import tempfile
@@ -43,6 +44,27 @@ def temporal_iou(first: Sequence[int], second: Sequence[int]) -> float:
     union = sum(a == 1 or b == 1 for a, b in zip(first, second))
     return intersection / union if union else 1.0
 
+def binary_f1(first: Sequence[int], second: Sequence[int]) -> float:
+    selected_first = sum(first)
+    selected_second = sum(second)
+    true_positive = sum(
+        a == 1 and b == 1 for a, b in zip(first, second)
+    )
+
+    denominator = selected_first + selected_second
+    if denominator == 0:
+        return 1.0
+    return 2.0 * true_positive / denominator
+
+
+def mean_annotation_f1(
+    prediction: Sequence[int],
+    annotations: Sequence[Sequence[int]],
+) -> float:
+    return sum(
+        binary_f1(prediction, annotation)
+        for annotation in annotations
+    ) / len(annotations)
 
 def temporal_medoid(
     annotations: Sequence[Sequence[int]],
@@ -156,14 +178,15 @@ def _indices_to_label(indices: Sequence[int], frame_count: int) -> list[int]:
 
 
 def create_intermediate_rejected(
-    chosen: Sequence[int], rng: random.Random, max_shift: int = 2
+    chosen: Sequence[int], rng: random.Random, max_shift: int = 8
 ) -> list[int]:
     """Trasla leggermente il chosen preservandone esattamente la cardinalita'."""
     selected = [index for index, value in enumerate(chosen) if value == 1]
     if not selected or len(selected) == len(chosen):
         raise ValueError("Il chosen deve contenere sia frame scelti sia non scelti")
 
-    shift = min(max_shift, max(1, round(len(chosen) * 0.02)))
+    # shift = min(max_shift, max(1, round(len(chosen) * 0.02)))
+    shift = max(2, min(max_shift, round(len(chosen) * 0.05)))
     candidates: list[list[int]] = []
 
     # La proiezione monotona evita wrap-around e perdita di frame ai bordi.
@@ -266,15 +289,81 @@ def create_hard_rejected(
 
     if not windows:
         raise ValueError("Impossibile trovare un segmento rejected sostitutivo")
-    _, replacement_start, replacement_end, _ = max(
-        windows, key=lambda item: (item[0], item[3])
+    chosen_score = mean_annotation_f1(chosen, annotations)
+    valid_candidates = []
+
+    for _, replacement_start, replacement_end, _ in windows:
+        candidate = list(chosen)
+
+        for index in range(remove_start, remove_end + 1):
+            candidate[index] = 0
+
+        for index in range(replacement_start, replacement_end + 1):
+            candidate[index] = 1
+
+        candidate_score = mean_annotation_f1(candidate, annotations)
+        margin = chosen_score - candidate_score
+
+        if margin >= 0.05:
+            valid_candidates.append((candidate_score, rng.random(), candidate))
+
+    if not valid_candidates:
+        raise ValueError(
+        "Nessun rejected hard con margine F1 di almeno 0.05"
     )
 
+    # Il più plausibile fra quelli certamente peggiori.
+    _, _, rejected = max(
+        valid_candidates,
+        key=lambda item: (item[0], item[1]),
+    )
+    return rejected
+
+
+def create_overcoverage_rejected(
+    chosen: Sequence[int],
+    rng: random.Random,
+    min_ratio: float = 0.80,
+    max_ratio: float = 1.00,
+) -> list[int]:
+    """Aggiunge frame fino a coprire gran parte della timeline.
+
+    Questo negativo ha intenzionalmente una cardinalita' maggiore del chosen:
+    espone il DPO a una coppia che distingue la qualita' anche lungo la
+    dimensione della compressione.
+    """
+    frame_count = len(chosen)
+    selected = {index for index, value in enumerate(chosen) if value == 1}
+    available = [index for index, value in enumerate(chosen) if value == 0]
+    if not selected or not available:
+        raise ValueError(
+            "Il chosen deve contenere sia frame scelti sia frame non scelti"
+        )
+    if not 0 < min_ratio <= max_ratio <= 1:
+        raise ValueError("i rapporti di over-coverage devono stare in (0, 1]")
+
+    target = round(frame_count * rng.uniform(min_ratio, max_ratio))
+    target = max(len(selected) + 1, min(frame_count, target))
+    extra_count = target - len(selected)
     rejected = list(chosen)
-    for index in range(remove_start, remove_end + 1):
-        rejected[index] = 0
-    for index in range(replacement_start, replacement_end + 1):
+    # for index in rng.sample(available, extra_count):
+    #     rejected[index] = 1
+    distance_to_chosen = {
+    index: min(abs(index - selected_index) for selected_index in selected)
+    for index in available
+    }
+
+    ranked_available = sorted(
+    available,
+    key=lambda index: (
+        distance_to_chosen[index],
+        rng.random(),
+    ),
+    )
+
+    for index in ranked_available[:extra_count]:
         rejected[index] = 1
+
     return rejected
 
 
@@ -283,8 +372,16 @@ def add_dpo_pairs(
     limit: int | None = None,
     seed: int = 42,
     max_shift: int = 2,
+    overcoverage_min_ratio: float = 0.80,
+    overcoverage_max_ratio: float = 1.00,
+    hard_ratio: float = 0.50,
+    intermediate_ratio: float = 0.30,
+    overcoverage_ratio: float = 0.20,
+    overcoverage_profile: str = "mixed",
+    overcoverage_band_ratios: Sequence[float] = (0.50, 0.30, 0.20),
+    chosen_field: str = "vsum_onehot_medoid",
 ) -> dict[str, int]:
-    """Aggiunge chosen/rejected bilanciati tra intermediate e hard."""
+    """Aggiunge chosen/rejected nelle proporzioni richieste."""
     if isinstance(payload, dict):
         records = list(payload.items())
     elif isinstance(payload, list):
@@ -294,59 +391,188 @@ def add_dpo_pairs(
     if limit is not None:
         records = records[:limit]
 
-    # Un hard deve poter conservare almeno un intero evento corretto.
-    # I record con un solo segmento vengono quindi assegnati a intermediate;
-    # gli altri sono mescolati per evitare correlazioni con l'ordine del JSON.
-    hard_candidates = [
-        position
-        for position, (_, record) in enumerate(records)
-        if isinstance(record, dict)
-        and len(_selected_segments(record.get("vsum_onehot_medoid", []))) >= 2
-    ]
+    # Essere multi-evento non basta: per alcuni video nessuna sostituzione
+    # produce il margine F1 minimo. Precalcoliamo quindi i rejected hard e
+    # candidiamo soltanto i record per cui ne esiste davvero uno valido.
+    hard_rejected_by_position: dict[int, list[int]] = {}
+    for position, (record_key, record) in enumerate(records):
+        if (
+            not isinstance(record, dict)
+            or len(_selected_segments(record.get(chosen_field, []))) < 2
+        ):
+            continue
+        candidate_seed = int.from_bytes(
+            hashlib.sha256(f"{seed}:{record_key}".encode()).digest()[:8], "big"
+        )
+        try:
+            hard_rejected_by_position[position] = create_hard_rejected(
+                record[chosen_field],
+                record["vsum_onehot"],
+                random.Random(candidate_seed),
+            )
+        except ValueError:
+            # Il record resta utilizzabile per intermediate/overcoverage.
+            continue
+    hard_candidates = list(hard_rejected_by_position)
     random.Random(seed).shuffle(hard_candidates)
-    hard_target = len(records) // 2
+    hard_target = round(len(records) * hard_ratio)
+    overcoverage_target = round(len(records) * overcoverage_ratio)
+    intermediate_target = len(records) - hard_target - overcoverage_target
+    if intermediate_target < 0:
+        raise ValueError("Le proporzioni richieste producono conteggi non validi")
     if len(hard_candidates) < hard_target:
         raise ValueError(
-            "Non ci sono abbastanza video multi-evento per creare il 50% di hard"
+            f"Non ci sono abbastanza video multi-evento per creare {hard_target} "
+            f"rejected hard (disponibili: {len(hard_candidates)})"
         )
     hard_indices = set(hard_candidates[:hard_target])
-    counts = {"intermediate": 0, "hard": 0}
+    remaining = [
+        position for position in range(len(records))
+        if position not in hard_indices
+    ]
+    intermediate_rejected_by_position: dict[int, list[int]] = {}
+    for position in remaining:
+        record_key, record = records[position]
+        candidate_seed = int.from_bytes(
+            hashlib.sha256(f"{seed}:{record_key}".encode()).digest()[:8], "big"
+        )
+        try:
+            candidate = create_intermediate_rejected(
+                record[chosen_field], random.Random(candidate_seed), max_shift
+            )
+        except ValueError:
+            continue
+        chosen_score = mean_annotation_f1(
+            record[chosen_field], record["vsum_onehot"]
+        )
+        rejected_score = mean_annotation_f1(candidate, record["vsum_onehot"])
+        if chosen_score - rejected_score >= 0.05:
+            intermediate_rejected_by_position[position] = candidate
+
+    intermediate_candidates = list(intermediate_rejected_by_position)
+    random.Random(seed + 1).shuffle(intermediate_candidates)
+    if len(intermediate_candidates) < intermediate_target:
+        raise ValueError(
+            f"Non ci sono abbastanza record con un rejected intermediate valido "
+            f"per crearne {intermediate_target} (disponibili dopo gli hard: "
+            f"{len(intermediate_candidates)})"
+        )
+    intermediate_indices = set(intermediate_candidates[:intermediate_target])
+    overcoverage_indices = set(remaining) - intermediate_indices
+    if len(overcoverage_indices) != overcoverage_target:
+        raise AssertionError("Allocazione hard/intermediate/overcoverage incoerente")
+    overcoverage_bands: dict[int, tuple[str, float, float]] = {}
+    if overcoverage_profile == "mixed":
+        ordered_overcoverage = sorted(overcoverage_indices)
+        random.Random(seed + 2).shuffle(ordered_overcoverage)
+        first_count = round(overcoverage_target * overcoverage_band_ratios[0])
+        second_count = round(overcoverage_target * overcoverage_band_ratios[1])
+        # L'ultima banda assorbe l'eventuale residuo di arrotondamento.
+        first_count = min(first_count, overcoverage_target)
+        second_count = min(second_count, overcoverage_target - first_count)
+        band_specs = (
+            ("30-40", 0.30, 0.40, first_count),
+            ("40-60", 0.40, 0.60, second_count),
+            (
+                "70-100", 0.70, 1.00,
+                overcoverage_target - first_count - second_count,
+            ),
+        )
+        cursor = 0
+        for band_name, band_min, band_max, band_count in band_specs:
+            for record_position in ordered_overcoverage[cursor:cursor + band_count]:
+                overcoverage_bands[record_position] = (
+                    band_name, band_min, band_max
+                )
+            cursor += band_count
+    counts = {"intermediate": 0, "hard": 0, "overcoverage": 0}
+    band_counts = {"30-40": 0, "40-60": 0, "70-100": 0}
 
     for position, (record_key, record) in enumerate(records):
         if not isinstance(record, dict):
             raise ValueError(f"Il record {record_key!r} non e' un oggetto JSON")
-        if "vsum_onehot_medoid" not in record:
+        if chosen_field not in record:
             raise ValueError(
-                f"Campo vsum_onehot_medoid mancante nel record {record_key!r}"
+                f"Campo {chosen_field} mancante nel record {record_key!r}"
             )
 
-        chosen = list(record["vsum_onehot_medoid"])
+        chosen = list(record[chosen_field])
         record_seed = int.from_bytes(
             hashlib.sha256(f"{seed}:{record_key}".encode()).digest()[:8], "big"
         )
         rng = random.Random(record_seed)
-        difficulty = "hard" if position in hard_indices else "intermediate"
+        if position in hard_indices:
+            difficulty = "hard"
+        elif position in intermediate_indices:
+            difficulty = "intermediate"
+        else:
+            difficulty = "overcoverage"
         try:
             if difficulty == "intermediate":
-                rejected = create_intermediate_rejected(chosen, rng, max_shift)
+                rejected = intermediate_rejected_by_position[position]
+            elif difficulty == "hard":
+                rejected = hard_rejected_by_position[position]
             else:
-                rejected = create_hard_rejected(chosen, record["vsum_onehot"], rng)
+                if overcoverage_profile == "mixed":
+                    band_name, coverage_min, coverage_max = overcoverage_bands[position]
+                else:
+                    band_name = "uniform"
+                    coverage_min = overcoverage_min_ratio
+                    coverage_max = overcoverage_max_ratio
+                rejected = create_overcoverage_rejected(
+                    chosen, rng, coverage_min, coverage_max
+                )
         except ValueError as error:
             raise ValueError(f"Record {record_key!r}: {error}") from error
 
+        chosen_score = mean_annotation_f1(
+        chosen, record["vsum_onehot"])
+        rejected_score = mean_annotation_f1(
+        rejected, record["vsum_onehot"])
+        preference_margin = chosen_score - rejected_score
+
         if rejected == chosen:
             raise AssertionError(f"Record {record_key!r}: chosen e rejected coincidono")
-        if sum(rejected) != sum(chosen):
+        if difficulty != "overcoverage" and sum(rejected) != sum(chosen):
             raise AssertionError(
                 f"Record {record_key!r}: chosen e rejected hanno cardinalita' diverse"
+            )
+        if difficulty == "overcoverage" and sum(rejected) <= sum(chosen):
+            raise AssertionError(
+                f"Record {record_key!r}: overcoverage non aggiunge frame"
             )
 
         record["vsum_onehot_chosen"] = chosen
         record["vsum_onehot_rejected"] = rejected
         record["dpo_rejected_difficulty"] = difficulty
         record["dpo_chosen_rejected_iou"] = temporal_iou(chosen, rejected)
+        record["dpo_chosen_f1_mean"] = chosen_score
+        record["dpo_rejected_f1_mean"] = rejected_score
+        record["dpo_preference_margin"] = preference_margin
+        # Per hard/intermediate il rejected deve essere peggiore anche rispetto
+        # alle annotazioni. Un overcoverage, invece, contiene il chosen e frame
+        # extra: soprattutto nella banda 30-40% puo' aumentare il recall e avere
+        # un F1 simile o superiore. In quel caso la preferenza DPO deriva dalla
+        # violazione della concisione, quindi il margine resta una diagnostica
+        # ma non e' un vincolo di validita'.
+        if difficulty != "overcoverage" and preference_margin < 0.05:
+            raise ValueError(
+                f"Record {record_key!r} ({difficulty}): margine DPO "
+                f"insufficiente: chosen={chosen_score:.4f}, "
+                f"rejected={rejected_score:.4f}, "
+                f"margin={preference_margin:.4f}"
+            )
+        if difficulty == "overcoverage":
+            record["dpo_overcoverage_band"] = band_name
+            record["dpo_overcoverage_ratio"] = sum(rejected) / len(rejected)
+            if band_name in band_counts:
+                band_counts[band_name] += 1
+        else:
+            record.pop("dpo_overcoverage_band", None)
+            record.pop("dpo_overcoverage_ratio", None)
         counts[difficulty] += 1
 
+    counts.update({f"overcoverage_{name}": value for name, value in band_counts.items()})
     return counts
 
 
@@ -397,8 +623,45 @@ def parse_args() -> argparse.Namespace:
         help="Seed per generazione e bilanciamento dei rejected (default: 42)",
     )
     parser.add_argument(
-        "--max-shift", type=int, default=2,
-        help="Traslazione massima dei rejected intermediate (default: 2)",
+    "--max-shift",
+    type=int,
+    default=8,
+    help="Traslazione massima dei rejected intermediate (default: 8)",
+)
+    parser.add_argument(
+        "--overcoverage-min-ratio", type=float, default=0.80,
+        help="Copertura minima della timeline per gli overcoverage (default: 0.80)",
+    )
+    parser.add_argument(
+        "--overcoverage-max-ratio", type=float, default=1.00,
+        help="Copertura massima della timeline per gli overcoverage (default: 1.00)",
+    )
+    parser.add_argument(
+        "--hard-ratio", type=float, default=0.50,
+        help="Proporzione di rejected hard (default: 0.50)",
+    )
+    parser.add_argument(
+        "--intermediate-ratio", type=float, default=0.30,
+        help="Proporzione di rejected intermediate (default: 0.30)",
+    )
+    parser.add_argument(
+        "--overcoverage-ratio", type=float, default=0.20,
+        help="Proporzione di rejected overcoverage (default: 0.20)",
+    )
+    parser.add_argument(
+        "--overcoverage-profile", choices=("mixed", "uniform"), default="mixed",
+        help=(
+            "mixed usa le bande 30-40/40-60/70-100; uniform usa "
+            "--overcoverage-min-ratio e --overcoverage-max-ratio (default: mixed)"
+        ),
+    )
+    parser.add_argument(
+        "--overcoverage-band-ratios", type=float, nargs=3,
+        metavar=("LOW", "MEDIUM", "HIGH"), default=(0.50, 0.30, 0.20),
+        help=(
+            "quote interne alle bande 30-40, 40-60 e 70-100 "
+            "(default: 0.50 0.30 0.20)"
+        ),
     )
     return parser.parse_args()
 
@@ -409,6 +672,30 @@ def main() -> None:
         raise SystemExit("--limit deve essere un intero positivo")
     if args.max_shift <= 0:
         raise SystemExit("--max-shift deve essere un intero positivo")
+    if not 0 < args.overcoverage_min_ratio <= args.overcoverage_max_ratio <= 1:
+        raise SystemExit(
+            "i rapporti di over-coverage devono rispettare 0 < min <= max <= 1"
+        )
+    type_ratios = (
+        args.hard_ratio,
+        args.intermediate_ratio,
+        args.overcoverage_ratio,
+    )
+    if any(ratio < 0 or ratio > 1 for ratio in type_ratios):
+        raise SystemExit("le proporzioni dei rejected devono essere comprese tra 0 e 1")
+    if not math.isclose(sum(type_ratios), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise SystemExit(
+            "--hard-ratio + --intermediate-ratio + --overcoverage-ratio "
+            f"deve essere 1.0 (somma ricevuta: {sum(type_ratios):.12g})"
+        )
+    if any(ratio < 0 or ratio > 1 for ratio in args.overcoverage_band_ratios):
+        raise SystemExit("le quote delle bande overcoverage devono stare tra 0 e 1")
+    if not math.isclose(
+        sum(args.overcoverage_band_ratios), 1.0, rel_tol=0.0, abs_tol=1e-9
+    ):
+        raise SystemExit(
+            "le tre quote di --overcoverage-band-ratios devono sommare a 1.0"
+        )
     if args.input.resolve() == args.output.resolve():
         raise SystemExit("Input e output devono essere file diversi")
 
@@ -417,13 +704,27 @@ def main() -> None:
 
     processed = add_medoid_labels(payload, args.limit)
     difficulty_counts = add_dpo_pairs(
-        payload, args.limit, seed=args.seed, max_shift=args.max_shift
+        payload,
+        args.limit,
+        seed=args.seed,
+        max_shift=args.max_shift,
+        overcoverage_min_ratio=args.overcoverage_min_ratio,
+        overcoverage_max_ratio=args.overcoverage_max_ratio,
+        hard_ratio=args.hard_ratio,
+        intermediate_ratio=args.intermediate_ratio,
+        overcoverage_ratio=args.overcoverage_ratio,
+        overcoverage_profile=args.overcoverage_profile,
+        overcoverage_band_ratios=args.overcoverage_band_ratios,
     )
     write_json_atomically(payload, args.output)
     print(
         f"Elaborati {processed} video: "
         f"{difficulty_counts['intermediate']} rejected intermediate, "
-        f"{difficulty_counts['hard']} rejected hard. "
+        f"{difficulty_counts['hard']} rejected hard, "
+        f"{difficulty_counts['overcoverage']} rejected overcoverage. "
+        f"Bande overcoverage: 30-40%={difficulty_counts['overcoverage_30-40']}, "
+        f"40-60%={difficulty_counts['overcoverage_40-60']}, "
+        f"70-100%={difficulty_counts['overcoverage_70-100']}. "
         f"Risultato salvato in: {args.output}"
     )
 

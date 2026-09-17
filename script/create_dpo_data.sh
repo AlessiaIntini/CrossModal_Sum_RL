@@ -11,7 +11,7 @@
 set -euo pipefail
 
 PROJECT_DIR="/leonardo/home/userexternal/aintini0/GRPOVideo"
-VENV_DIR="/leonardo_scratch/fast/IscrC_HydroFM/aintini0/venvs/grpovideo"
+VENV_DIR="/leonardo_scratch/fast/IscrC_MSMU/aintini0/venvs/grpovideo"
 
 cd "$PROJECT_DIR"
 module load python/3.11.7
@@ -20,4 +20,4 @@ source "$VENV_DIR/bin/activate"
 export HF_HOME="${SCRATCH}/GRPOVideo/cache/huggingface"
 export PIP_CACHE_DIR="${SCRATCH}/GRPOVideo/cache/pip"
 
-python createDPODate.py "$@"
+python /leonardo/home/userexternal/aintini0/GRPOVideo/configuration/createDPODate.py "$@"

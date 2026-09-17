@@ -1,4 +1,8 @@
+import argparse
+import json
 import math
+import re
+from pathlib import Path
 
 from sklearn.metrics import precision_recall_curve, f1_score
 
@@ -398,3 +402,154 @@ def concat_all_gather(tensor):
 
     output = torch.cat(tensors_gather, dim=0)
     return output
+
+
+def load_vsum_predictions(predictions_path, index_base=1):
+    """Legge i JSONL di predizioni: {video_id: (indici o stringa V2Xum, base degli indici)}."""
+    predictions_path = Path(predictions_path)
+    files = sorted(predictions_path.glob("*.jsonl")) if predictions_path.is_dir() else [predictions_path]
+    if not files:
+        raise FileNotFoundError(f"Nessuna predizione in {predictions_path}")
+    predictions = {}
+    for path in files:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("record_type") not in (None, "sample") or "video_id" not in row:
+                    continue
+                video_id = str(row["video_id"])
+                if video_id in predictions:
+                    raise ValueError(f"video_id duplicato: {video_id}")
+                if "selected_frame_indices" in row:
+                    predictions[video_id] = ([int(x) for x in row["selected_frame_indices"]], 0)
+                else:
+                    predictions[video_id] = (str(row.get("summary", "")), index_base)
+    return predictions
+
+
+def load_vsum_annotations(annotations_path):
+    """Legge le annotazioni VideoXum (lista o dict) indicizzate per video_id."""
+    with Path(annotations_path).open(encoding="utf-8") as handle:
+        annotations = json.load(handle)
+    if isinstance(annotations, list):
+        annotations_by_video = {}
+        for position, row in enumerate(annotations):
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"Annotazione in posizione {position} non valida: atteso un oggetto JSON"
+                )
+            video_id = row.get("video_id") or row.get("id")
+            if not video_id:
+                raise ValueError(
+                    f"Annotazione in posizione {position} senza video_id o id"
+                )
+            video_id = str(video_id)
+            if video_id in annotations_by_video:
+                raise ValueError(f"video_id duplicato nelle annotazioni: {video_id}")
+            annotations_by_video[video_id] = row
+        annotations = annotations_by_video
+    elif not isinstance(annotations, dict):
+        raise ValueError(
+            "Formato annotazioni non valido: attesa una lista o un oggetto JSON"
+        )
+    return annotations
+
+
+def annotation_references(video_id, row):
+    """Restituisce (frame_count, matrice binaria 10 x frame_count) di un video."""
+    required_fields = {"sampled_frames", "vsum_onehot"}
+    missing_fields = sorted(required_fields - row.keys())
+    if missing_fields:
+        raise ValueError(
+            f"{video_id}: annotazione frame-level non valida; campi "
+            f"mancanti: {', '.join(missing_fields)}. Usa il metadata "
+            "VideoXum con sampled_frames e vsum_onehot."
+        )
+    frame_count = int(row["sampled_frames"])
+    references = np.asarray(row["vsum_onehot"], dtype=np.int8)
+    if references.shape != (10, frame_count):
+        raise ValueError(f"{video_id}: shape {references.shape}, attesa (10, {frame_count})")
+    return frame_count, references
+
+
+def prediction_mask(prediction_data, item_base, frame_count):
+    """Converte una predizione in maschera binaria; restituisce (maschera, indici fuori range)."""
+    if isinstance(prediction_data, list):
+        raw = prediction_data
+    else:
+        # V2Xum contiene numeri con zero iniziale (es. 06).
+        raw = [int(x) for x in re.findall(r"\d+", prediction_data)]
+    indices = [x - item_base for x in raw]
+    invalid = [x + item_base for x in indices if not 0 <= x < frame_count]
+    prediction = np.zeros(frame_count, dtype=np.int8)
+    valid = {x for x in indices if 0 <= x < frame_count}
+    if valid:
+        prediction[list(valid)] = 1
+    return prediction, invalid
+
+
+def evaluate_vsum_files(predictions_path, annotations_path, output_path, index_base=1):
+    """Valuta shard V2Xum JSONL contro le 10 annotazioni binarie VideoXum."""
+    predictions = load_vsum_predictions(predictions_path, index_base)
+    annotations = load_vsum_annotations(annotations_path)
+    names = ("f1_min", "f1_max", "f1_mean", "kendall", "spearman")
+    collected = {name: [] for name in names}
+    missing = invalid_total = 0
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as output:
+        for video_id, row in annotations.items():
+            if video_id not in predictions:
+                missing += 1
+                continue
+            frame_count, references = annotation_references(video_id, row)
+            prediction, invalid = prediction_mask(*predictions[video_id], frame_count)
+            invalid_total += len(invalid)
+
+            intersections = (references * prediction[None, :]).sum(axis=1)
+            denominators = references.sum(axis=1) + prediction.sum()
+            f1s = np.divide(2.0 * intersections, denominators,
+                            out=np.zeros(10, dtype=float), where=denominators != 0)
+            saliency = references.mean(axis=0)
+            tau = kendalltau(rankdata(-prediction), rankdata(-saliency))[0]
+            rho = spearmanr(prediction, saliency)[0]
+            metrics = {
+                "f1_min": float(f1s.min()), "f1_max": float(f1s.max()),
+                "f1_mean": float(f1s.mean()),
+                "kendall": 0.0 if math.isnan(tau) else float(tau),
+                "spearman": 0.0 if math.isnan(rho) else float(rho),
+            }
+            for name in names:
+                collected[name].append(metrics[name])
+            output.write(json.dumps({
+                "record_type": "sample", "video_id": video_id,
+                "selected_frames": int(prediction.sum()), "invalid_indices": invalid,
+                "f1_per_annotator": f1s.tolist(), **metrics,
+            }) + "\n")
+
+        evaluated = len(collected["f1_mean"])
+        if not evaluated:
+            raise ValueError("Nessuna predizione corrisponde alle annotazioni")
+        summary = {
+            "record_type": "summary", "videos_evaluated": evaluated,
+            "predictions_total": len(predictions), "annotations_total": len(annotations),
+            "missing_predictions": missing,
+            "extra_predictions": len(set(predictions) - set(annotations)),
+            "invalid_indices": invalid_total, "index_base": index_base,
+            **{name: float(np.mean(values)) for name, values in collected.items()},
+        }
+        output.write(json.dumps(summary) + "\n")
+    print(json.dumps(summary, indent=2))
+    print(f"Risultati salvati in {output_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Valuta predizioni V-sum su VideoXum")
+    parser.add_argument("--predictions", type=Path, required=True)
+    parser.add_argument("--annotations", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--index-base", type=int, choices=(0, 1), default=1)
+    cli = parser.parse_args()
+    evaluate_vsum_files(cli.predictions, cli.annotations, cli.output, cli.index_base)

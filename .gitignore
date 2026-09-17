@@ -10,3 +10,8 @@ dataset/
 temp/
 models/
 logs/*.whl
+*.orig
+*.whl
+nltk_data/
+nltk_data.tar.gz
+train_videoxum_dpo_*.json

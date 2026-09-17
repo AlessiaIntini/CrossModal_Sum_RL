@@ -10,8 +10,8 @@
 #SBATCH --mem=64G
 #SBATCH --time=16:00:00
 #SBATCH --chdir=/leonardo/home/userexternal/aintini0/GRPOVideo
-#SBATCH --output=/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/logs/infer-sft-%j.out
-#SBATCH --error=/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/logs/infer-sft-%j.err
+#SBATCH --output=/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/logs/infer-sft-ConsensusDataset-%j.out
+#SBATCH --error=/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/logs/infer-sft-ConsensusDataset-%j.err
 
 set -Eeuo pipefail
 trap 'rc=$?; echo "[ERROR] infer_sft_test_cineca.sh: riga $LINENO, exit=$rc, comando: $BASH_COMMAND" >&2' ERR
@@ -20,10 +20,10 @@ PROJECT_DIR="/leonardo/home/userexternal/aintini0/GRPOVideo"
 VENV_DIR="${VENV_DIR:-/leonardo_scratch/fast/IscrC_MSMU/aintini0/venvs/grpovideo}"
 DATA_ROOT="${DATA_ROOT:-/leonardo_work/IscrC_HydroFM/aintini0/datasets/videoxum}"
 MODEL_DIR="${MODEL_DIR:-/leonardo_work/IscrC_HydroFM/aintini0/models/Qwen3-VL-8B-Instruct}"
-CHECKPOINT="${CHECKPOINT:-${SFT_CHECKPOINT:-/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/checkpoints-sft/Qwen3-VL-8B-Instruct/checkpoint-best}}"
+CHECKPOINT="${CHECKPOINT:-${SFT_CHECKPOINT:-/leonardo_scratch/fast/IscrC_HydroFM/aintini0/GRPOVideo/checkpoints-sft-ConsensusDataset/Qwen3-VL-8B-Instruct/checkpoint-best}}"
 TEST_JSON="${TEST_JSON:-$DATA_ROOT/metadata/test_videoxum.json}"
 TEST_VIDEO_DIR="${TEST_VIDEO_DIR:-$DATA_ROOT/test}"
-OUTPUT_DIR="${INFERENCE_OUTPUT_DIR:-/leonardo_work/IscrC_HydroFM/aintini0/GRPOVideo/results/inference-sft}"
+OUTPUT_DIR="${INFERENCE_OUTPUT_DIR:-/leonardo_work/IscrC_HydroFM/aintini0/GRPOVideo/results/inference-sft-ConsensusDataset}"
 SCRATCH_ROOT="${SCRATCH:-/leonardo_scratch/fast/IscrC_HydroFM/aintini0}"
 
 cd "$PROJECT_DIR"
@@ -60,13 +60,18 @@ echo "[INFO] test_video_dir=$TEST_VIDEO_DIR"
 echo "[INFO] output=$OUTPUT_DIR"
 echo "[INFO] subset start=${TEST_START_INDEX:-0} samples=${TEST_SAMPLES:-0} (0=tutti)"
 echo "[INFO] attention=${ATTN_IMPL:-flash_attention_2}"
+# max_pixels/min_pixels/timeline_unit: se non impostati si ereditano dal
+# video_encoding.json del checkpoint; per i checkpoint che non lo hanno valgono
+# i default (200704, 3136, frame).
+echo "[INFO] max_pixels=${MAX_PIXELS:-dal checkpoint} min_pixels=${MIN_PIXELS:-dal checkpoint} timeline_unit=${TIMELINE_UNIT:-dal checkpoint}"
 echo "[INFO] python=$(command -v python)"
 python --version
 nvidia-smi
 
 srun python -c 'import sys, torch; print(f"[INFO] torch={torch.__version__} cuda_build={torch.version.cuda} cuda_available={torch.cuda.is_available()}"); sys.exit(0 if torch.cuda.is_available() else "PyTorch non riesce a inizializzare CUDA")'
 
-srun python -u infer_sft_videoxum.py \
+srun python -u infer_videoxum.py \
+    --mode sft \
     --model "$MODEL_DIR" \
     --checkpoint "$CHECKPOINT" \
     --test_json "$TEST_JSON" \
@@ -76,6 +81,9 @@ srun python -u infer_sft_videoxum.py \
     --start_index "${TEST_START_INDEX:-0}" \
     --num_samples "${TEST_SAMPLES:-0}" \
     --attn_impl "${ATTN_IMPL:-flash_attention_2}" \
+    ${MAX_PIXELS:+--max_pixels "$MAX_PIXELS"} \
+    ${MIN_PIXELS:+--min_pixels "$MIN_PIXELS"} \
+    ${TIMELINE_UNIT:+--timeline_unit "$TIMELINE_UNIT"} \
     --eval_max_new_tokens "${MAX_NEW_TOKENS:-256}" \
     --device cuda:0
 

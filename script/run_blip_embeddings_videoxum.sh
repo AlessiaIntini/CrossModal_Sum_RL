@@ -2,7 +2,6 @@
 #SBATCH --account=IscrC_HydroFM
 #SBATCH --job-name=blip-embed-videoxum
 #SBATCH --mail-type=ALL
-#SBATCH --mail-user=alessia.intini@polito.it
 #SBATCH --partition=boost_usr_prod
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
@@ -36,6 +35,12 @@ DATA_ROOT="${DATA_ROOT:-/leonardo_work/IscrC_HydroFM/aintini0/datasets/videoxum}
 OUT_DIR="${OUT_DIR:-$DATA_ROOT/feat/blip}"
 SCRATCH_ROOT="${SCRATCH:-/leonardo_scratch/fast/IscrC_HydroFM/aintini0}"
 MODEL_DIR="${MODEL_DIR:-/leonardo_work/IscrC_HydroFM/aintini0/models/blip-image-captioning-base}"
+# Il nuovo extract_blip_embeddings.py legge il conteggio frame atteso da qui
+# (stesso file con "sampled_frames" usato da DPO/SFT/train_grpo.py), invece di
+# derivarlo da fps/total_frames del container video: elimina i mismatch
+# occasionali con prepare_video(). Un metadata json per split.
+TRAIN_METADATA_JSON="${TRAIN_METADATA_JSON:-$DATA_ROOT/metadata/train_videoxum.json}"
+VAL_METADATA_JSON="${VAL_METADATA_JSON:-$DATA_ROOT/metadata/val_videoxum.json}"
 
 [[ -x "$VENV_DIR/bin/python" ]] || {
   echo "[ERROR] Virtualenv assente o non eseguibile: $VENV_DIR" >&2
@@ -77,8 +82,11 @@ else
   SPLITS="${SPLITS:-train val}"
 fi
 MODEL_NAME="$MODEL_DIR"
-SAMPLE_FPS=1.0
-BATCH_SIZE=32
+BATCH_SIZE="${BATCH_SIZE:-32}"
+# In uno Slurm job array ogni task riceve automaticamente uno shard disgiunto.
+# Fuori da un array i default 0/1 mantengono il comportamento originale.
+SHARD_INDEX="${SLURM_ARRAY_TASK_ID:-0}"
+SHARD_COUNT="${SLURM_ARRAY_TASK_COUNT:-1}"
 
 mkdir -p "$CODE_DIR/logs" "$OUT_DIR"
 
@@ -96,6 +104,8 @@ for split in $SPLITS; do
   esac
   p="$DATA_ROOT/$split"
   if [ -d "$p" ]; then echo "  [OK] dir  $p"; else echo "  [MANCA] dir  $p"; fail=1; fi
+  if [ "$split" = "train" ]; then meta="$TRAIN_METADATA_JSON"; else meta="$VAL_METADATA_JSON"; fi
+  if [ -f "$meta" ]; then echo "  [OK] metadata $meta"; else echo "  [MANCA] metadata $meta"; fail=1; fi
 done
 if [ -f "$CODE_DIR/configuration/extract_blip_embeddings.py" ]; then
   echo "  [OK] script $CODE_DIR/configuration/extract_blip_embeddings.py"
@@ -122,7 +132,9 @@ cd "$CODE_DIR"
 echo "[INFO] data root : $DATA_ROOT"
 echo "[INFO] output dir: $OUT_DIR"
 echo "[INFO] model     : $MODEL_NAME"
-srun python -c 'import cv2, numpy, torch, transformers; print(f"[INFO] torch={torch.__version__} cuda={torch.cuda.is_available()} transformers={transformers.__version__}"); raise SystemExit(0 if torch.cuda.is_available() else "CUDA non disponibile")'
+echo "[INFO] shard     : $((SHARD_INDEX + 1))/$SHARD_COUNT"
+echo "[INFO] batch size: $BATCH_SIZE"
+srun python -c 'import av, numpy, torch, transformers; print(f"[INFO] torch={torch.__version__} cuda={torch.cuda.is_available()} transformers={transformers.__version__}"); raise SystemExit(0 if torch.cuda.is_available() else "CUDA non disponibile")'
 
 # ── estrazione embedding (niente vLLM: modello caricato in-process via transformers) ──
 # python -u = output non bufferizzato -> i print e la progress bar (tqdm) compaiono
@@ -134,15 +146,20 @@ trap - ERR
 PY_RC=0
 for split in $SPLITS; do
   VIDEO_DIR="$DATA_ROOT/$split"
+  if [ "$split" = "train" ]; then METADATA_JSON="$TRAIN_METADATA_JSON"; else METADATA_JSON="$VAL_METADATA_JSON"; fi
   echo "-------------------------------------------------------------------"
   echo "[INFO] Avvio estrazione embedding BLIP su VideoXum/$split: $(date)"
+  echo "[INFO] metadata: $METADATA_JSON"
   srun python -u "$CODE_DIR/configuration/extract_blip_embeddings.py" \
+    --metadata_json "$METADATA_JSON" \
     --video_dir "$VIDEO_DIR" \
     --output_dir "$OUT_DIR" \
     --model_name "$MODEL_NAME" \
-    --sample_fps "$SAMPLE_FPS" \
     --batch_size "$BATCH_SIZE" \
-    --device cuda
+    --device cuda \
+    --shard-index "$SHARD_INDEX" \
+    --shard-count "$SHARD_COUNT" \
+    ${OVERWRITE:+--overwrite}
   SPLIT_RC=$?
   if [ "$SPLIT_RC" -ne 0 ]; then
     echo "[ERROR] Estrazione dello split '$split' fallita (exit=$SPLIT_RC)."

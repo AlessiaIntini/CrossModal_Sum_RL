@@ -18,6 +18,32 @@ import torch.nn.functional as F
 
 EPSILON = 1e-8
 EXPECTED_FIELDS = {"selected_frames", "summary"}
+# Pesi della somma pesata in VideoSummaryReward.score. Un peso 0 spegne il
+# termine nella reward di training, ma la componente resta calcolata e loggata.
+DEFAULT_REWARD_WEIGHTS = {
+    "f_beta": 0.25,
+    "diversity": 0.10,
+    "representativeness": 0.10,
+    "grounding": 0.25,
+    "reference": 0.10,
+    "format": 0.10,
+    # Lunghezza del summary rispetto al reference: SBERT (reference) e grounding
+    # sono quasi insensibili alla lunghezza, mentre CIDEr-D/ROUGE/METEOR la
+    # penalizzano molto (CIDEr-D con sigma=6 parole). Senza questo termine GRPO
+    # converge su una frase da ~25 parole contro reference da ~49.
+    "summary_length": 0.10,
+}
+# Deviazione standard in log-rapporto parole(summary)/parole(reference):
+# rapporto 0.7 o 1.4 -> ~0.6, rapporto 0.5 o 2.0 -> ~0.14.
+SUMMARY_LENGTH_SIGMA = 0.35
+
+_CODE_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
+
+def _strip_code_fence(completion: str) -> str:
+    if not isinstance(completion, str):
+        return completion
+    match = _CODE_FENCE_RE.match(completion.strip())
+    return match.group(1) if match else completion
 
 
 class CompletionValidationError(ValueError):
@@ -30,6 +56,36 @@ class ParsedCompletion:
     summary: str
     pred_mask: torch.Tensor
     selected_indices: list[int]
+    merged_adjacent_count: int = 0
+
+
+def pair_timeline_length(frame_count: int) -> int:
+    """Numero di segmenti (coppie di frame) di un video da frame_count frame."""
+    return (frame_count + 1) // 2
+
+
+def expand_pair_completion(
+    parsed: ParsedCompletion, frame_count: int
+) -> ParsedCompletion:
+    """Riporta una completion espressa in segmenti agli N frame originali.
+
+    Il segmento g copre i frame 2g e 2g+1 (l'ultimo solo N-1 se N e' dispari).
+    Le feature visive, le maschere degli eventi e il budget della reward restano
+    sui frame, quindi ogni componente conserva la stessa semantica."""
+    intervals = [
+        [2 * start, min(2 * end + 1, frame_count - 1)]
+        for start, end in parsed.selected_frames
+    ]
+    indices = [index for start, end in intervals for index in range(start, end + 1)]
+    mask = torch.zeros(frame_count, dtype=torch.bool)
+    mask[indices] = True
+    return ParsedCompletion(
+        selected_frames=intervals,
+        summary=parsed.summary,
+        pred_mask=mask,
+        selected_indices=indices,
+        merged_adjacent_count=parsed.merged_adjacent_count,
+    )
 
 
 class SemanticEncoder(Protocol):
@@ -80,6 +136,8 @@ class VideoRewardCache:
     consensus: torch.Tensor         # float [T]
     captions: tuple[str, ...]
     reference_summary: str
+    frame_floor_sim: float          # similarita' coseno "tipica" tra due frame del video (ridondanza di base)
+    frame_min_sim: float            # similarita' coseno minima osservabile tra due frame del video
 
 
 def _is_integer(value: Any) -> bool:
@@ -110,11 +168,9 @@ def _decode_json(completion: str) -> Any:
     if not isinstance(completion, str):
         raise CompletionValidationError("completion deve essere una stringa")
     try:
-        # json.loads richiede che non esistano Markdown o spiegazioni fuori dal JSON.
-        return _strict_json_loads(completion)
+        return _strict_json_loads(_strip_code_fence(completion))
     except (json.JSONDecodeError, ValueError) as error:
         raise CompletionValidationError(f"JSON non valido: {error}") from error
-
 
 def parse_and_validate_completion(
     completion: str,
@@ -146,6 +202,7 @@ def parse_and_validate_completion(
     selected_indices: list[int] = []
     clean_intervals: list[list[int]] = []
     previous_end = -2
+    merged_adjacent_count = 0
     for item in intervals:
         if not isinstance(item, list) or len(item) != 2:
             raise CompletionValidationError("ogni intervallo deve essere [start, end]")
@@ -157,21 +214,29 @@ def parse_and_validate_completion(
         if start <= previous_end:
             raise CompletionValidationError("intervalli non ordinati o sovrapposti")
         if previous_end >= 0 and start == previous_end + 1:
-            raise CompletionValidationError("gli intervalli adiacenti devono essere uniti")
-        clean_intervals.append([start, end])
+            # Cosmetico, non logico: i frame coperti non cambiano rispetto a un
+            # unico intervallo [prev_start, end]. Si unisce automaticamente
+            # invece di scartare l'intero completion (vedi compute_format_reward
+            # e VideoSummaryReward.score per la piccola penalita' associata),
+            # cosi' un errore puramente sintattico non azzera anche f1/grounding
+            # e non elimina la varianza di reward all'interno del gruppo GRPO.
+            clean_intervals[-1][1] = end
+            merged_adjacent_count += 1
+        else:
+            clean_intervals.append([start, end])
         selected_indices.extend(range(start, end + 1))
         previous_end = end
 
     if len(selected_indices) != len(set(selected_indices)):
         raise CompletionValidationError("uno stesso frame e' selezionato piu' volte")
-    if len(selected_indices) > max_selected:
-        raise CompletionValidationError(
-            f"selezionati {len(selected_indices)} frame, massimo consentito {max_selected}"
-        )
 
     summary = payload["summary"]
     if not isinstance(summary, str) or not summary.strip():
         raise CompletionValidationError("summary deve essere una stringa non vuota")
+
+    # Il superamento del budget non e' piu' un errore strutturale: viene
+    # penalizzato in modo continuo da VideoSummaryReward.score (length_penalty)
+    # invece di azzerare qui l'intera completion con un muro discreto.
 
     pred_mask = torch.zeros(count, dtype=torch.bool)
     pred_mask[selected_indices] = True
@@ -180,13 +245,14 @@ def parse_and_validate_completion(
         summary=summary.strip(),
         pred_mask=pred_mask,
         selected_indices=selected_indices,
+        merged_adjacent_count=merged_adjacent_count,
     )
 
 
 def compute_format_reward(completion: str, count: int, max_selected: int) -> float:
     """Credito graduale a quattro livelli, indipendente dalla validita' finale."""
     try:
-        payload = _strict_json_loads(completion) if isinstance(completion, str) else None
+        payload = _strict_json_loads(_strip_code_fence(completion)) if isinstance(completion, str) else None
     except (json.JSONDecodeError, ValueError):
         return 0.0
 
@@ -212,7 +278,7 @@ def compute_format_reward(completion: str, count: int, max_selected: int) -> flo
                 not _is_integer(start)
                 or not _is_integer(end)
                 or not 0 <= start <= end < count
-                or start <= previous_end + 1
+                or start <= previous_end  # overlap/ordine: resta un errore vero
             ):
                 indices_valid = False
                 break
@@ -226,6 +292,17 @@ def compute_format_reward(completion: str, count: int, max_selected: int) -> flo
     if isinstance(summary, str) and bool(summary.strip()):
         reward += 0.25
     return reward
+
+
+def compute_summary_length_reward(
+    summary: str, reference: str, sigma: float = SUMMARY_LENGTH_SIGMA
+) -> float:
+    """Gaussiana sul log-rapporto delle parole: 1 a pari lunghezza, simmetrica
+    tra summary troppo corti e troppo lunghi (meta' e doppio valgono uguale)."""
+    words, reference_words = len(summary.split()), len(reference.split())
+    if words == 0 or reference_words == 0:
+        return 0.0
+    return math.exp(-(math.log(words / reference_words) ** 2) / (2.0 * sigma ** 2))
 
 
 def split_into_sentences(text: str) -> list[str]:
@@ -276,11 +353,39 @@ class VideoSummaryReward:
         event_mask_converter: EventMaskConverter | None = None,
         reference_metric: ReferenceMetric | None = None,
         epsilon: float = EPSILON,
+        f_beta: float = 0.5,
+        weights: dict[str, float] | None = None,
+        use_length_penalty: bool = True,
+        summary_length_sigma: float = SUMMARY_LENGTH_SIGMA,
+        timeline_unit: str = "frame",
     ) -> None:
+        if timeline_unit not in ("frame", "pair"):
+            raise ValueError(f"timeline_unit non valida: {timeline_unit}")
+        # Unita' degli indici nella completion; la cache e le componenti restano
+        # sempre sui frame (vedi expand_pair_completion).
+        self.timeline_unit = timeline_unit
         self.semantic_encoder = semantic_encoder
+        self.weights = {**DEFAULT_REWARD_WEIGHTS, **(weights or {})}
+        if unknown := set(self.weights) - set(DEFAULT_REWARD_WEIGHTS):
+            raise ValueError(f"pesi reward sconosciuti: {sorted(unknown)}")
+        if any(value < 0 for value in self.weights.values()):
+            raise ValueError("i pesi della reward devono essere >= 0")
+        if not any(self.weights.values()):
+            raise ValueError("almeno un peso della reward deve essere > 0")
+        self.use_length_penalty = bool(use_length_penalty)
+        if summary_length_sigma <= 0:
+            raise ValueError("summary_length_sigma deve essere positivo")
+        self.summary_length_sigma = float(summary_length_sigma)
         self.event_mask_converter = event_mask_converter or default_event_mask_converter
         self.reference_metric = reference_metric
         self.epsilon = float(epsilon)
+        if f_beta <= 0:
+            raise ValueError("f_beta deve essere positivo")
+        # beta<1 pesa la precisione piu' della recall: selezionare frame extra
+        # che non colpiscono gli intervalli annotati costa piu' di quanto valga
+        # l'eventuale recall guadagnata, cosi' il reward non premia piu' selezioni
+        # ampie di per se' (vedi discussione F1 -> F-beta).
+        self.f_beta = float(f_beta)
         self._cache: dict[Hashable, VideoRewardCache] = {}
 
     def clear_cache(self) -> None:
@@ -329,12 +434,40 @@ class VideoSummaryReward:
             raise ValueError(f"frame_features deve avere shape [{count}, D]")
         visual = F.normalize(visual, dim=-1, eps=self.epsilon)
 
+        # Baseline di ridondanza del video: quanto sono simili tra loro due frame
+        # qualsiasi, in media e nel caso migliore. I frame di uno stesso video sono
+        # spesso gia' molto simili anche senza alcuna selezione mirata: senza
+        # calibrare rispetto a questa baseline, representativeness e diversity
+        # saturano rispettivamente vicino a 1 e vicino a 0 indipendentemente dalla
+        # qualita' reale della selezione (vedi commenti in score()).
+        if count >= 2:
+            frame_sim_matrix = visual @ visual.T
+            off_diag = frame_sim_matrix[~torch.eye(count, dtype=torch.bool)]
+            frame_floor_sim = off_diag.mean().item()
+            frame_min_sim = off_diag.min().item()
+        else:
+            frame_floor_sim, frame_min_sim = 0.0, -1.0
+
         reference_summary = " ".join(captions)
         encoded = self.semantic_encoder.encode([*captions, reference_summary])
         encoded = _as_normalized_embeddings(encoded, len(captions) + 1).cpu()
+        # Budget legato alla ricchezza del reference (parole totali delle caption),
+        # non a una frazione fissa della timeline: un video con un reference
+        # sintetico deve restare compatto, uno con un reference ricco puo'
+        # coprire piu' frame. 1.3x lascia un margine sopra la lunghezza "attesa".
+        # Il floor al 20% del video e' un vincolo di osservabilita': il prompt
+        # annuncia al modello un target del ~20% (15-25%), mentre la lunghezza del
+        # reference non e' visibile al modello. Senza il floor un reference corto
+        # produrrebbe un budget piu' stretto di quello annunciato, penalizzando il
+        # modello per un'informazione che non puo' vedere; con il floor un
+        # reference ricco concede solo headroom in piu'.
+        max_selected = max(1, min(count, max(
+            math.ceil(0.20 * count),
+            math.ceil(1.3 * len(reference_summary.split())),
+        )))
         cache = VideoRewardCache(
             count=count,
-            max_selected=max(1, math.ceil(0.20 * count)),
+            max_selected=max_selected,
             vsum_onehot=gt,
             event_masks=event_masks,
             frame_features=visual,
@@ -343,29 +476,46 @@ class VideoSummaryReward:
             consensus=gt.float().mean(dim=0),
             captions=captions,
             reference_summary=reference_summary,
+            frame_floor_sim=frame_floor_sim,
+            frame_min_sim=frame_min_sim,
         )
         self._cache[cache_key] = cache
         return cache
+
+    def timeline_limits(self, data: VideoRewardCache) -> tuple[int, int]:
+        """(numero di indici, budget di selezione) nell'unita' della completion."""
+        if self.timeline_unit == "pair":
+            return (
+                pair_timeline_length(data.count),
+                max(1, math.ceil(data.max_selected / 2)),
+            )
+        return data.count, data.max_selected
 
     @staticmethod
     def _invalid_result(format_reward: float) -> dict[str, Any]:
         return {
             "total_reward": float(format_reward - 1.0),
+            "total_reward_default": float(format_reward - 1.0),
             "format_reward": float(format_reward),
-            "f1_reward": 0.0,
+            "f_beta_reward": 0.0,
             "diversity_reward": 0.0,
             "representativeness_reward": 0.0,
             "grounding_reward": 0.0,
             "grounded_coverage": 0.0,
             "grounded_precision": 0.0,
             "reference_reward": 0.0,
+            "summary_length_reward": 0.0,
+            "summary_words": 0,
             "selected_count": 0,
             "selected_ratio": 0.0,
+            "selection_budget": 0,
+            "length_penalty": 0.0,
             "valid": False,
-            "f1_max": 0.0,
-            "f1_min": 0.0,
-            "f1_std": 0.0,
-            "f1_per_annotator": [],
+            "merged_adjacent_count": 0,
+            "f_beta_max": 0.0,
+            "f_beta_min": 0.0,
+            "f_beta_std": 0.0,
+            "f_beta_per_annotator": [],
         }
 
     @torch.no_grad()
@@ -374,28 +524,46 @@ class VideoSummaryReward:
         if cache_key not in self._cache:
             raise KeyError(f"video {cache_key!r} non presente nella cache")
         data = self._cache[cache_key]
+        timeline_count, timeline_budget = self.timeline_limits(data)
         #reward format dell'output
         format_reward = compute_format_reward(
-            completion, data.count, data.max_selected
+            completion, timeline_count, timeline_budget
         )
         try:
             # parsing e validazione rigida della completion JSON
             parsed = parse_and_validate_completion(
-                completion, data.count, data.max_selected
+                completion, timeline_count, timeline_budget
             )
         except CompletionValidationError:
             return self._invalid_result(format_reward)
+        if self.timeline_unit == "pair":
+            parsed = expand_pair_completion(parsed, data.count)
+
+        if parsed.merged_adjacent_count:
+            # Penalita' graduale invece di rigetto totale: l'errore e' puramente
+            # sintattico (i frame selezionati non cambiano), ma va comunque
+            # disincentivato senza azzerare f1/grounding/reference dell'intero
+            # completion (vedi discussione sul reward -0.25 sistematico quando
+            # tutto il gruppo GRPO violava questa regola allo stesso modo).
+            format_reward = max(0.0, format_reward - 0.1 * parsed.merged_adjacent_count)
 
         pred = parsed.pred_mask.cpu()
         pred_count = int(pred.sum().item())
 
+        beta2 = self.f_beta ** 2
         intersections = (data.vsum_onehot & pred.unsqueeze(0)).sum(dim=1).float()
-        denominators = pred_count + data.vsum_onehot.sum(dim=1).float()
-        f1_values = torch.where(
-            denominators > 0, 2.0 * intersections / denominators, 0.0
+        gt_counts = data.vsum_onehot.sum(dim=1).float()
+        # F-beta = (1+beta^2)*TP / (beta^2*GT + pred): forma chiusa equivalente a
+        # (1+beta^2)*P*R/(beta^2*P+R) ma senza dividere esplicitamente per
+        # precision/recall (beta=1 riduce alla vecchia formula F1).
+        f_beta_denominators = beta2 * gt_counts + pred_count
+        f_beta_values = torch.where(
+            f_beta_denominators > 0,
+            (1.0 + beta2) * intersections / f_beta_denominators,
+            0.0,
         )
-        #reward f1 medio su tutti gli annotatori, normalizzato in [0, 1], vede se i frame selezionati coprono bene gli intervalli annotati
-        f1_reward = f1_values.mean().item()
+        #reward f-beta medio su tutti gli annotatori, normalizzato in [0, 1]: premia la precisione della selezione, non solo la copertura
+        f_beta_reward = f_beta_values.mean().item()
 
         prototypes = []
         for start, end in parsed.selected_frames:
@@ -407,13 +575,29 @@ class VideoSummaryReward:
             group_features = torch.stack(prototypes)
             similarity = group_features @ group_features.T
             pairs = torch.triu_indices(len(prototypes), len(prototypes), offset=1)
+            raw_pair_sim = similarity[pairs[0], pairs[1]]
+            # Calibrata sulla ridondanza di base del video (vedi frame_floor_sim in
+            # prepare_video): 0 se due segmenti sono simili quanto una coppia
+            # tipica dello stesso video, 1 se simili quanto la coppia piu'
+            # dissimile osservabile. Senza questa calibrazione la similarita' di
+            # base gia' alta tra frame dello stesso video schiaccia la reward
+            # vicino al suo stesso soffitto (~0.02-0.05), qualunque selezione.
+            diversity_denom = max(data.frame_floor_sim - data.frame_min_sim, 0.05)
             diversity_reward = (
-                (1.0 - similarity[pairs[0], pairs[1]]) / 2.0
+                (data.frame_floor_sim - raw_pair_sim) / diversity_denom
             ).clamp(0.0, 1.0).mean().item()
 
         selected_features = data.frame_features[parsed.selected_indices]
-        coverage = (data.frame_features @ selected_features.T).max(dim=1).values
-        coverage = ((coverage + 1.0) / 2.0).clamp(0.0, 1.0)
+        raw_coverage = (data.frame_features @ selected_features.T).max(dim=1).values
+        # Calibrata sulla stessa baseline di ridondanza: 0 se il frame selezionato
+        # piu' vicino non e' piu' simile del "rumore di fondo" tipico del video, 1
+        # solo per un match (quasi) esatto. Senza questa calibrazione quasi ogni
+        # selezione sparsa sulla timeline ottiene copertura vicina a 1, perche' la
+        # similarita' di base tra frame dello stesso video e' gia' molto alta.
+        representativeness_denom = max(1.0 - data.frame_floor_sim, 0.05)
+        coverage = (
+            (raw_coverage - data.frame_floor_sim) / representativeness_denom
+        ).clamp(0.0, 1.0)
         representativeness_reward = (
             (data.consensus * coverage).sum()
             / (data.consensus.sum() + self.epsilon)
@@ -459,31 +643,68 @@ class VideoSummaryReward:
             ))
             reference_reward = min(1.0, max(0.0, reference_reward))
 
-        total_reward = (
-            0.25 * f1_reward
-            + 0.10 * diversity_reward
-            + 0.10 * representativeness_reward
-            + 0.30 * grounding_reward
-            + 0.15 * reference_reward
-            + 0.10 * format_reward
+        summary_length_reward = compute_summary_length_reward(
+            parsed.summary, data.reference_summary, self.summary_length_sigma
         )
+
+        # Penalita' continua sul budget, non piu' a soglia: cresce con il quadrato
+        # del rapporto selezione/budget, quindi morde gia' ben prima di raggiungere
+        # il vecchio muro (a rapporto=1 vale 0.5) invece di scattare di colpo solo
+        # dopo averlo superato. Cappata a 0.85 (non 1.0): anche con uno sforamento
+        # enorme resta un moltiplicatore residuo di 0.15, cosi' un gruppo GRPO
+        # interamente sopra budget non collassa su un total_reward identico per
+        # tutti (vedi combinazione moltiplicativa sotto).
+        selection_ratio = pred_count / data.max_selected
+        length_penalty = min(0.85, (selection_ratio ** 2) / 2.0)
+
+        # Moltiplicativa, non sottrattiva: una penalita' additiva puo' spingere
+        # sotto zero e farsi clampare a un identico 0.0 per l'intero gruppo,
+        # cancellando differenze reali tra le altre componenti (osservato in
+        # training: 4 completion con grounding/format molto diversi, tutte
+        # total_reward=0.0 perche' tutte oltre budget). Scalando la somma pesata
+        # invece di sottrarne una quota fissa, la differenza relativa tra
+        # completion sopravvive anche quando la penalita' e' vicina al cap.
+        components = {
+            "f_beta": f_beta_reward,
+            "diversity": diversity_reward,
+            "representativeness": representativeness_reward,
+            "grounding": grounding_reward,
+            "reference": reference_reward,
+            "format": format_reward,
+            "summary_length": summary_length_reward,
+        }
+        # total_reward usa i pesi dell'esperimento e guida l'advantage GRPO;
+        # total_reward_default usa sempre la configurazione completa, cosi' la
+        # validation resta confrontabile tra ablation diverse.
+        weighted_reward = sum(self.weights[k] * v for k, v in components.items())
+        default_reward = sum(DEFAULT_REWARD_WEIGHTS[k] * v for k, v in components.items())
+        applied_penalty = length_penalty if self.use_length_penalty else 0.0
+        total_reward = weighted_reward * (1.0 - applied_penalty)
+        total_reward_default = default_reward * (1.0 - length_penalty)
         return {
             "total_reward": float(min(1.0, max(0.0, total_reward))),
+            "total_reward_default": float(min(1.0, max(0.0, total_reward_default))),
             "format_reward": float(format_reward),
-            "f1_reward": float(f1_reward),
+            "f_beta_reward": float(f_beta_reward),
             "diversity_reward": float(diversity_reward),
             "representativeness_reward": float(representativeness_reward),
             "grounding_reward": float(grounding_reward),
             "grounded_coverage": float(grounded_coverage),
             "grounded_precision": float(grounded_precision),
             "reference_reward": float(reference_reward),
+            "summary_length_reward": float(summary_length_reward),
+            "summary_words": len(parsed.summary.split()),
+            "reference_words": len(data.reference_summary.split()),
             "selected_count": pred_count,
             "selected_ratio": pred_count / data.count,
+            "selection_budget": data.max_selected,
+            "length_penalty": float(length_penalty),
             "valid": True,
-            "f1_max": float(f1_values.max().item()),
-            "f1_min": float(f1_values.min().item()),
-            "f1_std": float(f1_values.std(unbiased=False).item()),
-            "f1_per_annotator": [float(value) for value in f1_values.tolist()],
+            "merged_adjacent_count": parsed.merged_adjacent_count,
+            "f_beta_max": float(f_beta_values.max().item()),
+            "f_beta_min": float(f_beta_values.min().item()),
+            "f_beta_std": float(f_beta_values.std(unbiased=False).item()),
+            "f_beta_per_annotator": [float(value) for value in f_beta_values.tolist()],
         }
 
     @torch.no_grad()
