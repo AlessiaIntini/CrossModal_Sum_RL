@@ -17,7 +17,9 @@ from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 from transformers import AutoProcessor
 from transformers import get_cosine_schedule_with_warmup
-from grpo_rewards import (DEFAULT_REWARD_WEIGHTS, SUMMARY_LENGTH_SIGMA,
+from grpo_rewards import (DEFAULT_REWARD_WEIGHTS, F_BETA_AGGREGATIONS,
+                          LENGTH_BUDGET_SIGMA, REFERENCE_COSINE_FLOOR,
+                          REFERENCE_COSINE_SCALE, SUMMARY_LENGTH_SIGMA,
                           SentenceTransformerEncoder, VideoSummaryReward)
 from sft_train_videoxum import (
     add_pixel_arguments,
@@ -44,19 +46,26 @@ SYSTEM_PROMPT = "You are a video summarization assistant. Select representative 
 # fino al 2026-09-17 (una frase, ~25 parole). "reference" chiede la lunghezza dei
 # reference VideoXum: train mediana 44 parole (p10-p90 26-84), 3.7 frasi.
 SUMMARY_STYLES = ("reference", "concise")
-SUMMARY_WORD_RANGE = (35, 55)
+# Centrato su ~45 parole, la media geometrica delle lunghezze dei reference e
+# quindi l'ottimo di una policy che non puo' conoscere il bersaglio per-video.
+# Con il vecchio (35, 55) il modello si piazzava sul bordo basso del range (37.3
+# parole di media): prompt e reward chiedevano due cose diverse.
+SUMMARY_WORD_RANGE = (42, 50)
 SYSTEM_PROMPTS = {
     "concise": SYSTEM_PROMPT,
     "reference": "You are a video summarization assistant. Select representative frames and write a summary of the video.",
 }
 
 
-def summary_requirement(summary_style):
-    """(istruzione sul summary, esempio illustrativo) per lo stile richiesto."""
+def summary_requirement(summary_style, word_range=None):
+    """(istruzione sul summary, esempio illustrativo) per lo stile richiesto.
+
+    ``word_range`` sostituisce SUMMARY_WORD_RANGE solo in inferenza: il training
+    usa sempre il default, che e' anche quello del termine summary_length."""
     if summary_style == "concise":
         return ("Write exactly one concise summary of the video",
                 "A short one-sentence description of the video.")
-    low, high = SUMMARY_WORD_RANGE
+    low, high = word_range or SUMMARY_WORD_RANGE
     return (f"Write a summary of 3 to 4 sentences, about {low} to {high} words in "
             "total, describing the main events of the video in the order they happen",
             "First sentence describing the setting and the people. Second sentence "
@@ -88,7 +97,8 @@ def read_grpo_init(checkpoint):
     return True, Path(init_from) if init_from else None
 
 
-def build_grpo_prompt(count, index_phrase=" indexed from", summary_style="concise", unit="frame"):
+def build_grpo_prompt(count, index_phrase=" indexed from", summary_style="concise", unit="frame",
+                      word_range=None):
     """Prompt principale GRPO: selezione dei frame e summary.
 
     Riusa i blocchi condivisi con SFT e DPO (intro, selection requirements,
@@ -105,7 +115,7 @@ def build_grpo_prompt(count, index_phrase=" indexed from", summary_style="concis
     anche con le coppie, perche' il parser della reward lo richiede.
     ``summary_style`` cambia solo le righe sul summary (vedi SUMMARY_STYLES).
     """
-    requirement, example = summary_requirement(summary_style)
+    requirement, example = summary_requirement(summary_style, word_range)
     item = "segment" if unit == "pair" else "frame"
     return (
         build_timeline_intro(count, index_phrase, unit)
@@ -135,9 +145,9 @@ def build_grpo_prompt(count, index_phrase=" indexed from", summary_style="concis
     )
 
 
-def build_summary_only_prompt(count, summary_style="concise", unit="frame"):
+def build_summary_only_prompt(count, summary_style="concise", unit="frame", word_range=None):
     """Prompt alternativo per l'inferenza che richiede soltanto il summary."""
-    requirement, example = summary_requirement(summary_style)
+    requirement, example = summary_requirement(summary_style, word_range)
     if summary_style == "concise":
         requirement, example = "Write exactly one grammatical sentence", "A short one-sentence description of the video."
     timeline = (
@@ -361,23 +371,32 @@ def subset_indices(size, limit, seed):
 
 @torch.no_grad()
 def evaluate(model, processor, dataset, reward, args, device, log, run_id, epoch):
-    model.eval(); totals = {}
+    model.eval(); totals = {}; evaluated = skipped = 0
     validation_indices = subset_indices(len(dataset), args.val_samples, args.seed)
     for position, index in enumerate(tqdm(validation_indices, desc="validation", leave=False), 1):
-        sample = dataset[index]; ensure_reward_cache(reward, sample)
-        frames = decode_frames(sample, args.max_frames)
-        inputs = prompt_inputs(processor, sample, args, device, frames)
-        _, texts = generate(model, inputs, processor, args, False)
-        row = reward.score(texts[0], sample["cache_key"])
+        sample = dataset[index]
+        # Come in train: ~1.4% dei video val ha feature BLIP con un numero di frame
+        # incompatibile con il metadata (oltre il caso +1 gestito in
+        # ensure_reward_cache). Senza skip un solo video fa crashare la validation.
+        try:
+            ensure_reward_cache(reward, sample)
+            frames = decode_frames(sample, args.max_frames)
+            inputs = prompt_inputs(processor, sample, args, device, frames)
+            _, texts = generate(model, inputs, processor, args, False)
+            row = reward.score(texts[0], sample["cache_key"])
+        except Exception as error:
+            print(f"[warn] skip validation {sample['video_id']}: {type(error).__name__}: {error}")
+            skipped += 1; continue
+        evaluated += 1
         for key, value in row.items():
             if isinstance(value, (int,float,bool)): totals[key] = totals.get(key,0.) + float(value)
         write_metric(log, run_id=run_id, record_type="sample", split="validation", epoch=epoch,
                      sample_position=position, dataset_index=index,
                      video_id=sample["video_id"], completion=texts[0], **row)
-    means = {k:v/max(len(validation_indices),1) for k,v in totals.items()}
+    means = {k:v/max(evaluated,1) for k,v in totals.items()}
     write_metric(log, run_id=run_id, record_type="summary", split="validation", epoch=epoch,
-                 samples=len(validation_indices), **means)
-    print(f"[val] reward={means.get('total_reward',0):.4f} reward_default={means.get('total_reward_default',0):.4f} valid={means.get('valid',0)*100:.1f}% F_beta={means.get('f_beta_reward',0):.4f} summary_words={means.get('summary_words',0):.1f} summary_length={means.get('summary_length_reward',0):.4f}")
+                 samples=evaluated, skipped=skipped, **means)
+    print(f"[val] reward={means.get('total_reward',0):.4f} reward_default={means.get('total_reward_default',0):.4f} valid={means.get('valid',0)*100:.1f}% F_beta={means.get('f_beta_reward',0):.4f} summary_words={means.get('summary_words',0):.1f} summary_length={means.get('summary_length_reward',0):.4f} samples={evaluated} skipped={skipped}")
     return means
 
 
@@ -409,13 +428,24 @@ def train(args):
     reward = VideoSummaryReward(
         SentenceTransformerEncoder(args.semantic_model, args.semantic_device),
         f_beta=args.reward_f_beta,
+        f_beta_aggregation=args.f_beta_aggregation,
         weights={name: getattr(args, f"w_{name}") for name in DEFAULT_REWARD_WEIGHTS},
         use_length_penalty=args.length_penalty,
         summary_length_sigma=args.summary_length_sigma,
+        summary_target_words=args.summary_target_words,
+        length_budget_sigma=args.length_budget_sigma,
+        reference_cosine_floor=args.reference_cosine_floor,
+        reference_cosine_scale=args.reference_cosine_scale,
         timeline_unit=args.timeline_unit,
     )
     print(f"[reward] pesi={reward.weights} length_penalty={reward.use_length_penalty} "
+          f"f_beta={args.reward_f_beta} f_beta_aggregation={reward.f_beta_aggregation} "
           f"summary_style={args.summary_style} summary_length_sigma={reward.summary_length_sigma} "
+          f"summary_target_words={reward.summary_target_words or 'per-video'} "
+          f"summary_word_range={SUMMARY_WORD_RANGE} "
+          f"length_budget_sigma={reward.length_budget_sigma} "
+          f"reference_cosine=clamp((cos-{reward.reference_cosine_floor})"
+          f"/{reward.reference_cosine_scale}) "
           f"timeline_unit={reward.timeline_unit}")
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     save_dir, result_dir = args.saveroot/args.model.name, args.resultsroot/args.model.name
@@ -528,16 +558,38 @@ def parse_args():
     p.add_argument("--beta",type=float,default=.04); p.add_argument("--num_generations",type=positive_int,default=4)
     p.add_argument("--reward_f_beta",type=float,default=.5,
         help="beta della F-beta nella reward (1=F1; <1 pesa piu' la precisione, penalizzando selezioni ampie e imprecise)")
+    p.add_argument("--f_beta_aggregation", choices=F_BETA_AGGREGATIONS, default="max",
+        help="aggregazione della F-beta sui 10 annotatori: max e' l'aggregazione della "
+             "metrica di validation (F1_MAX) ed e' piu' discriminante fra rollout; "
+             "mean riproduce il comportamento precedente")
     for name, weight in DEFAULT_REWARD_WEIGHTS.items():
         p.add_argument(f"--w_{name}", type=float, default=weight,
             help=f"peso del termine {name} nella reward di training (default {weight}; 0 lo spegne)")
-    p.add_argument("--length_penalty", action=argparse.BooleanOptionalAction, default=True,
-        help="applica la penalita' moltiplicativa sul budget di frame (--no-length_penalty la spegne)")
+    p.add_argument("--length_penalty", action=argparse.BooleanOptionalAction, default=False,
+        help="riapplica la penalita' MOLTIPLICATIVA legacy sul budget di frame, sostituita "
+             "dalla componente additiva length_budget; serve solo a riprodurre i run "
+             "precedenti, insieme a --w_length_budget 0")
+    p.add_argument("--length_budget_sigma", type=float, default=LENGTH_BUDGET_SIGMA,
+        help="sigma (log-rapporto frame selezionati/budget) del termine length_budget della reward")
     p.add_argument("--summary_style", choices=SUMMARY_STYLES, default="reference",
-        help="reference: summary di 3-4 frasi (~35-55 parole) come i reference VideoXum; "
+        help=f"reference: summary di 3-4 frasi (~{SUMMARY_WORD_RANGE[0]}-{SUMMARY_WORD_RANGE[1]} "
+             "parole) come i reference VideoXum; "
              "concise: prompt a una frase dei checkpoint precedenti")
     p.add_argument("--summary_length_sigma", type=float, default=SUMMARY_LENGTH_SIGMA,
         help="sigma (log-rapporto parole) del termine summary_length della reward")
+    p.add_argument("--summary_target_words", type=positive_int, default=None,
+        help="bersaglio FISSO di parole per il termine summary_length, al posto della "
+             "lunghezza del reference del singolo video (default: per-video). Quella "
+             "e' imparabile solo in media (std 28 parole, R^2 0.078 sulla durata) e i "
+             "gradienti dei video corti e lunghi si cancellano; 45 e' la media "
+             "geometrica dei reference. Da abbinare a un --summary_length_sigma piu' "
+             "stretto (es. 0.20), che col bersaglio per-video peggiorerebbe invece la pendenza")
+    p.add_argument("--reference_cosine_floor", type=float, default=REFERENCE_COSINE_FLOOR,
+        help="floor della riscalatura clamp((cos-floor)/scale) del termine reference "
+             f"(default {REFERENCE_COSINE_FLOOR}, cioe' la vecchia (cos+1)/2 che satura; "
+             "0.30 con scale 0.50 porta la std intra-gruppo da 0.029 a 0.114)")
+    p.add_argument("--reference_cosine_scale", type=float, default=REFERENCE_COSINE_SCALE,
+        help=f"scale della riscalatura del termine reference (default {REFERENCE_COSINE_SCALE})")
     # 384 e non 256: con summary da ~50 parole e molti intervalli la vecchia
     # soglia troncava il JSON (426/4000 risposte invalide sul test grpo-dpo-v2)
     p.add_argument("--max_completion_length",type=positive_int,default=384); p.add_argument("--temperature",type=float,default=1.)

@@ -1,0 +1,5 @@
+# Dipendenze per train_grpo_trl.py, sft_train_videoxum_trl.py e train_dpo_trl.py:
+# quelle di train_grpo.py piu' TRL. Versione fissata: gli script TRL sovrascrivono
+# metodi interni di GRPOTrainer/SFTTrainer/DPOTrainer.
+-r requirements-grpo.txt
+trl==1.13.0

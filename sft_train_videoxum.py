@@ -394,6 +394,12 @@ def write_video_encoding(checkpoint, args):
                 "prompt_version": PROMPT_VERSIONS[timeline_unit],
                 "max_pixels": getattr(args, "max_pixels", None),
                 "min_pixels": getattr(args, "min_pixels", None),
+                # v2v: solo intervalli (questo script); v2vt: intervalli e summary
+                # (sft_train_videoxum_v2vt_trl.py). summary_style e' lo stile del
+                # prompt GRPO con cui il checkpoint e' stato addestrato: l'inferenza
+                # (infer_grpo_videoxum.py --summary_style) deve usare lo stesso.
+                "task": getattr(args, "task", "v2v"),
+                "summary_style": getattr(args, "summary_style", None),
             },
             indent=2,
         ) + "\n",
@@ -531,7 +537,11 @@ def build_messages(sample, args, response=None, video_frames=None):
     else:
         video["fps"] = args.fps
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+        # Il sample puo' portare il proprio system prompt (SFT V2VT: quello di
+        # train_grpo.SYSTEM_PROMPTS), cosi' prepare_completion resta unica.
+        {"role": "system", "content": [
+            {"type": "text", "text": sample.get("system_prompt", SYSTEM_PROMPT)}
+        ]},
         {"role": "user", "content": [
             video, {"type": "text", "text": sample["prompt"]}
         ]},
@@ -1348,9 +1358,26 @@ def train(args):
             if state.get("best_metric", "f1_mean") == args.best_metric:
                 best_score = float(state.get("best_f1_mean", -math.inf))
             random.setstate(state["python_rng_state"])
-            torch.set_rng_state(state["torch_rng_state"].cpu())
+            # torch.load qui sopra usa map_location=device, quindi anche gli stati
+            # RNG tornano su GPU, mentre set_rng_state* pretende ByteTensor su CPU
+            # (stessa normalizzazione di train_dpo.py).
+            cpu_rng_state = torch.as_tensor(
+                state["torch_rng_state"], dtype=torch.uint8, device="cpu"
+            ).contiguous()
+            torch.set_rng_state(cpu_rng_state)
             if device.type == "cuda" and state.get("cuda_rng_state") is not None:
-                torch.cuda.set_rng_state_all(state["cuda_rng_state"])
+                saved_cuda_rng = state["cuda_rng_state"]
+                # I checkpoint possono contenere una lista di ByteTensor, oppure
+                # un tensore/lista serializzato su CPU/GPU.
+                if isinstance(saved_cuda_rng, torch.Tensor):
+                    saved_cuda_rng = [saved_cuda_rng]
+                cuda_rng_states = [
+                    torch.as_tensor(
+                        rng_state, dtype=torch.uint8, device="cpu"
+                    ).contiguous()
+                    for rng_state in saved_cuda_rng
+                ]
+                torch.cuda.set_rng_state_all(cuda_rng_states)
             print(
                 f"[resume] stato completo da {state_path}: step={global_step}, "
                 f"epoch={start_epoch + 1}, campioni_gia_visti={samples_seen_in_epoch}"
