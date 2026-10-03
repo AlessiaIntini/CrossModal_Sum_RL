@@ -1,14 +1,22 @@
-# Dipendenze per train_dpo.py
+# Training (SFT, DPO, GRPO), inference and zero-shot baselines.
+# trl is pinned: the trainers override private methods of SFTTrainer, DPOTrainer and GRPOTrainer.
 --extra-index-url https://download.pytorch.org/whl/cu126
 torch==2.13.0+cu126
 torchvision==0.28.0+cu126
 transformers==5.16.1
 accelerate==1.14.0
 peft==0.20.0
+trl==1.13.0
 qwen-vl-utils==0.0.14
 av==18.1.0
 pillow==12.3.0
 tqdm==4.70.0
+numpy
 scikit-learn
 scipy
+sentence-transformers>=3.0
+rouge-score>=0.1.2
+nltk>=3.8
+pycocoevalcap
+requests
 opencv-python-headless>=4.10

@@ -1,4 +1,5 @@
-# Dipendenze per evaluation/eval.py
+# Additional dependencies of the evaluation scripts (python -m evaluation.<script>).
+# eval_tsum_coco.py also needs Java for the PTB tokenizer and METEOR.
 rouge-score>=0.1.2
 sentence-transformers>=3.0
 nltk>=3.8
