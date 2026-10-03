@@ -1,0 +1,9 @@
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files:  17%|█▋        | 1/6 [00:00<00:01,  2.77it/s]Fetching 6 files:  50%|█████     | 3/6 [00:15<00:17,  5.75s/it]Fetching 6 files:  67%|██████▋   | 4/6 [01:14<00:48, 24.05s/it]Fetching 6 files: 100%|██████████| 6/6 [01:14<00:00, 12.38s/it]
+Fetching 12 files:   0%|          | 0/12 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 12 files:   8%|▊         | 1/12 [00:00<00:04,  2.20it/s]Fetching 12 files:  58%|█████▊    | 7/12 [00:00<00:00, 12.39it/s]Fetching 12 files:  75%|███████▌  | 9/12 [00:00<00:00, 11.69it/s]Fetching 12 files:  92%|█████████▏| 11/12 [00:01<00:00, 10.83it/s]Fetching 12 files: 100%|██████████| 12/12 [00:01<00:00,  6.64it/s]
+[check] config e 779 chiavi coerenti con lkhl/VideoLLaMA3-7B-Image-HF
+[shard] model-00001-of-00004.safetensors: 104 tensori
+[shard] model-00002-of-00004.safetensors: 122 tensori
+[shard] model-00003-of-00004.safetensors: 462 tensori
+[shard] model-00004-of-00004.safetensors: 91 tensori
+[done] modello nativo salvato in /home/aintini/RL_VideoSum/GRPOVideo/models/VideoLLaMA3-7B-HF

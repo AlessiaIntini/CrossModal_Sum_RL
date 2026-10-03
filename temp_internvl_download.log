@@ -1,0 +1,6 @@
+Hint: A new version of huggingface_hub (1.32.0) is available! You are using version 1.29.0.
+To update, run: hf update
+Hint: The `hf-cli` skill is not installed. Run `hf skills add -g --claude` to teach your AI agents how to use the `hf` CLI.
+Still waiting to acquire lock on /home/aintini/RL_VideoSum/GRPOVideo/models/InternVL3_5-8B-HF/.cache/huggingface/.gitignore.lock (elapsed: 0.1 seconds)
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+path=/home/aintini/RL_VideoSum/GRPOVideo/models/InternVL3_5-8B-HF
