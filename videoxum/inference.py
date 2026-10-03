@@ -19,7 +19,7 @@ from .cli import add_video_arguments, nonnegative_int, positive_int
 from .data import SelectionDataset, load_joint_records, load_selection_records
 from .inputs import encode_prompt, generate_completions, generate_response
 from .jsonl import mean_or_none, new_run_id, write_record
-from .metrics import METRIC_NAMES, compute_f1, compute_kendall, compute_spearman, videoxum_metrics
+from .metrics import METRIC_NAMES, videoxum_metrics
 from .models import load_checkpoint_model
 from .parsing import (CompletionValidationError, parse_interval_response, parse_joint_response,
                       parse_summary_response, postprocess_interval_response)
@@ -367,125 +367,5 @@ def run_joint_inference(args):
                      samples_evaluated=len(totals["f1_mean"]), invalid_predictions=invalid,
                      processing_errors=errors, timeline_unit=args.timeline_unit, init_from=args.init_from,
                      **mean_values(totals), **baseline_summary)
-    print(f"[done] predictions: {predictions_path}")
-    print(f"[done] metrics: {metrics_path}")
-
-
-def rank_metrics(scores, references):
-    # Official Kendall/Spearman against the mean saliency and, averaged, against each annotator.
-    pred = torch.tensor(scores, dtype=torch.float32).unsqueeze(0)
-    refs = torch.tensor(references, dtype=torch.float32)
-    mask = torch.ones_like(pred)
-    repeated = pred.expand(len(refs), -1)
-    repeated_mask = torch.ones_like(repeated)
-    mean_saliency = refs.mean(dim=0, keepdim=True)
-    return {
-        "kendall": compute_kendall(pred, mean_saliency, mask, num_repeat=1)[2].item(),
-        "spearman": compute_spearman(pred, mean_saliency, mask, num_repeat=1)[2].item(),
-        "kendall_per_annotator": compute_kendall(repeated, refs, repeated_mask, num_repeat=len(refs))[2].item(),
-        "spearman_per_annotator": compute_spearman(repeated, refs, repeated_mask, num_repeat=len(refs))[2].item(),
-    }
-
-
-def score_metrics(scores, references):
-    # Official top-15% F1 and rank metrics of continuous frame scores.
-    pred = torch.tensor(scores, dtype=torch.float32).unsqueeze(0).expand(len(references), -1)
-    refs = torch.tensor(references, dtype=torch.float32)
-    _, f1_max, f1_mean = compute_f1(pred, refs, torch.ones_like(pred), num_repeat=len(references))
-    return {"f1_top15_max": f1_max.item(), "f1_top15_mean": f1_mean.item(), **rank_metrics(scores, references)}
-
-
-def sampled_scores(responses, sample, args):
-    # Score of a frame: the share of valid sampled responses that select it; also returns the number
-    # of valid responses.
-    masks = []
-    for response in responses:
-        try:
-            masks.append(parse_prediction(response, sample, args)[0])
-        except PARSE_ERRORS:
-            continue
-    if not masks:
-        return None, 0
-    return [sum(column) / len(masks) for column in zip(*masks)], len(masks)
-
-
-@torch.inference_mode()
-def run_score_sampling(args):
-    # V2VT greedy prediction plus frame scores from K sampled responses: the official rank metrics
-    # need continuous scores, and the share of sampled responses that select a frame estimates
-    # P(frame selected).
-    records, stop = select_range(load_joint_records(args.test_json, with_target=False),
-                                 args.start_index, args.num_samples)
-    device = torch.device(args.device)
-    model, processor, model_type = load_joint_model(args, device)
-    torch.manual_seed(args.seed)
-    run_id, predictions_path, metrics_path = open_outputs(args, args.run_name, stop)
-    sampling = dict(num_samples=args.score_samples, temperature=args.score_temperature, top_p=args.score_top_p)
-    totals, valid_counts = {}, []
-    invalid_greedy = no_valid_samples = errors = 0
-    with predictions_path.open("w", encoding="utf-8", buffering=1) as predictions_file, \
-            metrics_path.open("w", encoding="utf-8", buffering=1) as metrics_file:
-        for handle in (predictions_file, metrics_file):
-            write_record(handle, record_type="config", run_id=run_id, mode="score_sampling", arguments=vars(args))
-        for position, record in enumerate(tqdm(records, desc="test", unit="video")):
-            sample = joint_sample(record, args)
-            count, response = sample["sampled_frames"], None
-            try:
-                frames = decode_frames(sample["video_path"], count, args.max_frames)
-                inputs = encode_prompt(processor, sample, args, model_type, frames, device)
-                response = generate_completions(model, inputs, processor, args.max_completion_length)[1][0]
-                try:
-                    prediction, parsed, summary = parse_prediction(response, sample, args)
-                    parse_error = None
-                except PARSE_ERRORS as error:
-                    prediction, parsed, summary, parse_error = [0] * count, None, None, str(error)
-                    invalid_greedy += 1
-                # K sampled responses for the same prompt.
-                sampled = generate_completions(model, inputs, processor, args.max_completion_length, sampling)[1]
-                scores, valid = sampled_scores(sampled, sample, args)
-                valid_counts.append(valid)
-                # Without any valid sampled response the scores fall back to the greedy selection.
-                if scores is None:
-                    no_valid_samples += 1
-                    scores = [float(value) for value in prediction]
-                # greedy_*: metrics of the greedy selection; score_*: metrics of the sampled scores.
-                metrics = {
-                    **{f"greedy_{k}": v for k, v in {**videoxum_metrics(prediction, record["references"]),
-                                                    **rank_metrics(prediction, record["references"])}.items()},
-                    **{f"score_{k}": v for k, v in score_metrics(scores, record["references"]).items()},
-                }
-                for name, value in metrics.items():
-                    totals.setdefault(name, []).append(value)
-                write_record(predictions_file, record_type="sample", run_id=run_id,
-                             dataset_index=args.start_index + position, video_id=record["video_id"],
-                             sampled_frames=count, timeline_unit=args.timeline_unit,
-                             timeline_count=sample["timeline_count"], generated_response=response,
-                             prediction_valid=parse_error is None, parse_error=parse_error,
-                             predicted_intervals=parsed.selected_frames if parsed else [], summary=summary,
-                             selected_frame_indices=parsed.selected_indices if parsed else [],
-                             selected_frames=sum(prediction), selection_ratio=sum(prediction) / count,
-                             frame_scores=[round(value, 3) for value in scores], score_valid_samples=valid,
-                             score_selection_ratio_mean=sum(scores) / count)
-                write_record(metrics_file, record_type="sample", run_id=run_id, video_id=record["video_id"],
-                             prediction_valid=parse_error is None, score_valid_samples=valid, **metrics)
-            except Exception as error:
-                # A failing video (decoding, out of memory, ...) is logged and skipped.
-                errors += 1
-                for handle in (predictions_file, metrics_file):
-                    write_record(handle, record_type="sample_error", run_id=run_id, video_id=record["video_id"],
-                                 generated_response=response, error_type=type(error).__name__, error=str(error))
-                print(f"[warning] {record['video_id']}: {type(error).__name__}: {error}", flush=True)
-            finally:
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-        summary = mean_values(totals)
-        write_record(metrics_file, record_type="summary", run_id=run_id, samples_requested=len(records),
-                     samples_evaluated=len(valid_counts), invalid_greedy_predictions=invalid_greedy,
-                     videos_without_valid_samples=no_valid_samples, valid_samples_mean=mean_or_none(valid_counts),
-                     score_samples=args.score_samples, processing_errors=errors, **summary)
-    for variant in ("greedy", "score"):
-        print(f"[test] {variant}: " + " ".join(
-            f"{name[len(variant) + 1:]}={value:.4f}" for name, value in summary.items()
-            if name.startswith(f"{variant}_") and value is not None))
     print(f"[done] predictions: {predictions_path}")
     print(f"[done] metrics: {metrics_path}")

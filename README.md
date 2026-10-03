@@ -34,7 +34,6 @@ train_sft.py              SFT entry point (--task v2v | v2t | v2vt)
 train_dpo.py              DPO entry point
 train_grpo.py             GRPO entry point
 infer.py                  test-set inference of a trained adapter (--task v2v | v2t | v2vt)
-infer_score_sampling.py   V2VT inference with per-frame scores from sampled responses
 zero_shot.py              zero-shot baselines (--backend local | openrouter)
 evaluation/               evaluation and paper tables, run as python -m evaluation.<script>
 configuration/            consensus targets and DPO preference pairs
