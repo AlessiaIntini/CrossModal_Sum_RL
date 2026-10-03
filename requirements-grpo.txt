@@ -1,2 +1,0 @@
--r requirements-dpo.txt
-sentence-transformers>=3.0
